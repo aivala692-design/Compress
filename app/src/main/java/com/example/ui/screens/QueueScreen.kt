@@ -58,6 +58,7 @@ fun QueueScreen(
   uiState: StudioUiState,
   onSelectFilter: (QueueFilter) -> Unit,
   onAddVideos: () -> Unit,
+  onAddSafVideos: () -> Unit,
   onStartOrResume: () -> Unit,
   onPause: () -> Unit,
   onMoveJob: (Int, Int, List<VideoJobEntity>) -> Unit,
@@ -223,7 +224,14 @@ fun QueueScreen(
             ) {
               Icon(Icons.Default.Add, contentDescription = null, tint = CyanPrimary)
               Spacer(modifier = Modifier.width(6.dp))
-              Text("Select Videos (SAF)", color = CyanPrimary)
+              Text("Select Videos (Photo Picker)", color = CyanPrimary)
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            TextButton(
+              onClick = onAddSafVideos,
+              modifier = Modifier.testTag("empty_queue_saf_button"),
+            ) {
+              Text("Or Browse Device Folders (SAF)", color = TextSecondary)
             }
           }
         }

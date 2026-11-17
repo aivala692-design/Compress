@@ -83,6 +83,7 @@ import com.example.ui.theme.TextSecondary
 fun DashboardScreen(
   uiState: StudioUiState,
   onPickVideos: () -> Unit,
+  onPickSafVideos: () -> Unit,
   onPickOutputFolder: () -> Unit,
   onStartOrResume: () -> Unit,
   onPause: () -> Unit,
@@ -546,6 +547,16 @@ fun DashboardScreen(
             }
           }
 
+          OutlinedButton(
+            onClick = onPickSafVideos,
+            modifier = Modifier.fillMaxWidth().height(48.dp).testTag("browse_saf_videos_button"),
+            shape = RoundedCornerShape(14.dp),
+          ) {
+            Icon(Icons.Default.FolderOpen, contentDescription = null, tint = BlueSecondary)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Browse Device Folders (SAF)", color = MaterialTheme.colorScheme.onSurface)
+          }
+
           if (uiState.stats.failedCount > 0) {
             OutlinedButton(
               onClick = onRetryFailed,
@@ -594,7 +605,7 @@ fun DashboardScreen(
               Spacer(modifier = Modifier.height(4.dp))
               Text(
                 text =
-                  "Pick multiple videos via Storage Access Framework. CompressX processes sequentially with hardware acceleration, automatic software fallback, and zero cloud uploads.",
+                  "Pick multiple videos via Android Photo Picker or Storage Access Framework. CompressX processes sequentially with hardware acceleration, automatic software fallback, and zero cloud uploads.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextSecondary,
               )

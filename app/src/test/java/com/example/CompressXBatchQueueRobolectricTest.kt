@@ -123,4 +123,16 @@ class CompressXBatchQueueRobolectricTest {
     val capabilities = CodecCapabilityInspector.inspect()
     assertNotNull(capabilities.encoders)
   }
+
+  @Test
+  fun `pick multiple visual media video-only contract configures video mime filter`() {
+    val contract = androidx.activity.result.contract.ActivityResultContracts.PickMultipleVisualMedia()
+    val request =
+      androidx.activity.result.PickVisualMediaRequest(
+        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.VideoOnly
+      )
+    val intent = contract.createIntent(context, request)
+    assertEquals("video/*", intent.type)
+    assertTrue(intent.getBooleanExtra(android.content.Intent.EXTRA_ALLOW_MULTIPLE, false))
+  }
 }

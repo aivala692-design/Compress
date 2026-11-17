@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -94,8 +95,24 @@ fun CompressXApp(
   val snackbarHostState = remember { SnackbarHostState() }
   var previewJob by remember { mutableStateOf<VideoJobEntity?>(null) }
 
-  // Storage Access Framework: Multi-video picker (zero broad storage permissions)
-  val pickVideosLauncher =
+  // Android Photo Picker (PickVisualMedia.VideoOnly): multi-video selection without broad storage permissions
+  val pickMediaVideosLauncher =
+    rememberLauncherForActivityResult(
+      contract = ActivityResultContracts.PickMultipleVisualMedia(),
+    ) { uris ->
+      if (uris.isNotEmpty()) {
+        viewModel.onVideosSelected(uris)
+      }
+    }
+
+  val launchPhotoPicker = {
+    pickMediaVideosLauncher.launch(
+      PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+    )
+  }
+
+  // Storage Access Framework: Multi-video file browser for external/custom folders
+  val pickSafVideosLauncher =
     rememberLauncherForActivityResult(
       contract = ActivityResultContracts.OpenMultipleDocuments(),
     ) { uris ->
@@ -270,7 +287,8 @@ fun CompressXApp(
           composable<StudioRoute> {
             DashboardScreen(
               uiState = uiState,
-              onPickVideos = { pickVideosLauncher.launch(arrayOf("video/*")) },
+              onPickVideos = launchPhotoPicker,
+              onPickSafVideos = { pickSafVideosLauncher.launch(arrayOf("video/*")) },
               onPickOutputFolder = { pickOutputFolderLauncher.launch(null) },
               onStartOrResume = startBatchWithNotificationCheck,
               onPause = { viewModel.pauseBatch() },
@@ -288,7 +306,8 @@ fun CompressXApp(
             QueueScreen(
               uiState = uiState,
               onSelectFilter = { viewModel.selectFilter(it) },
-              onAddVideos = { pickVideosLauncher.launch(arrayOf("video/*")) },
+              onAddVideos = launchPhotoPicker,
+              onAddSafVideos = { pickSafVideosLauncher.launch(arrayOf("video/*")) },
               onStartOrResume = startBatchWithNotificationCheck,
               onPause = { viewModel.pauseBatch() },
               onMoveJob = { from, to, visible -> viewModel.moveJob(from, to, visible) },
