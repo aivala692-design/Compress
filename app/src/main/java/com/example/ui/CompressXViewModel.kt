@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.CompressXApplication
 import com.example.data.VideoJobEntity
+import com.example.engine.CompressionLogger
 import com.example.model.BatchSummaryStats
 import com.example.model.CodecCapabilities
 import com.example.model.CompressionPreset
@@ -110,12 +111,31 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       }
     }
 
-    // Ensure pending jobs recover smoothly when user reopens app after process death
+    // Ensure pending jobs recover smoothly when user opens app after process death
     viewModelScope.launch {
-      val config = prefsRepo.configFlow.first()
-      val pending = queueRepo.countPendingOrActive()
-      if (config.autoResumeAfterRestart && pending > 0) {
-        CompressionForegroundService.startQueue(app)
+      runCatching {
+        val config = prefsRepo.configFlow.first()
+        val pending = queueRepo.countPendingOrActive()
+        if (config.autoResumeAfterRestart && pending > 0) {
+          startQueueOrFallback(isAutoResume = true)
+        }
+      }.onFailure {
+        CompressionLogger.w("CompressXVM", "Auto-resume check failed safely", it)
+      }
+    }
+  }
+
+  private fun startQueueOrFallback(isAutoResume: Boolean = false) {
+    val startedFgs = CompressionForegroundService.startQueue(app)
+    if (!startedFgs) {
+      CompressionLogger.w(
+        "CompressXVM",
+        "Foreground service start unavailable (autoResume=$isAutoResume); running in-app fallback",
+      )
+      app.startInProcessFallbackQueue()
+      if (!isAutoResume) {
+        bannerMessage.value =
+          "Compressing while app stays open (background service restricted by system)."
       }
     }
   }
@@ -129,7 +149,8 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
         val addedCount = queueRepo.enqueueVideos(uris, currentConfig)
         bannerMessage.value = "Added $addedCount video${if (addedCount == 1) "" else "s"} to batch queue"
       } catch (t: Throwable) {
-        bannerMessage.value = "Failed to import selected videos: ${t.localizedMessage ?: "Unknown error"}"
+        CompressionLogger.e("CompressXVM", "Failed to import selected videos", t)
+        bannerMessage.value = "Failed to import selected videos: ${CompressionLogger.formatUserErrorMessage(t)}"
       } finally {
         isImporting.value = false
       }
@@ -145,8 +166,12 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
             android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
         )
+      }.onFailure {
+        CompressionLogger.w("CompressXVM", "Persistable SAF folder permission warning", it)
       }
-      val folderName = DocumentFile.fromTreeUri(app, treeUri)?.name ?: "Selected SAF Folder"
+      val folderName =
+        runCatching { DocumentFile.fromTreeUri(app, treeUri)?.name }.getOrNull()
+          ?: "Selected SAF Folder"
       prefsRepo.updateOutputFolder(treeUri.toString(), folderName)
       bannerMessage.value = "Output folder set to $folderName"
     }
@@ -168,7 +193,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
         return@launch
       }
       queueRepo.resumeAllPausedJobs()
-      CompressionForegroundService.startQueue(app)
+      startQueueOrFallback(isAutoResume = false)
     }
   }
 
@@ -194,14 +219,14 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
   fun retryJob(jobId: String) {
     viewModelScope.launch {
       queueRepo.retryJob(jobId)
-      CompressionForegroundService.startQueue(app)
+      startQueueOrFallback(isAutoResume = false)
     }
   }
 
   fun retryAllFailed() {
     viewModelScope.launch {
       queueRepo.retryAllFailedJobs()
-      CompressionForegroundService.startQueue(app)
+      startQueueOrFallback(isAutoResume = false)
     }
   }
 
@@ -285,6 +310,10 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
 
   fun setPreferHardware(enabled: Boolean) {
     viewModelScope.launch { prefsRepo.updatePreferHardware(enabled) }
+  }
+
+  fun reportMessage(message: String) {
+    bannerMessage.value = message
   }
 
   fun dismissBanner() {

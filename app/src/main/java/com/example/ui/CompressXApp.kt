@@ -105,12 +105,6 @@ fun CompressXApp(
       }
     }
 
-  val launchPhotoPicker = {
-    pickMediaVideosLauncher.launch(
-      PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
-    )
-  }
-
   // Storage Access Framework: Multi-video file browser for external/custom folders
   val pickSafVideosLauncher =
     rememberLauncherForActivityResult(
@@ -121,6 +115,26 @@ fun CompressXApp(
       }
     }
 
+  val launchSafPicker = {
+    try {
+      pickSafVideosLauncher.launch(arrayOf("video/*"))
+    } catch (t: Throwable) {
+      com.example.engine.CompressionLogger.e("CompressXUI", "Failed launching SAF video picker", t)
+      viewModel.reportMessage("No video file picker available on this device.")
+    }
+  }
+
+  val launchPhotoPicker = {
+    try {
+      pickMediaVideosLauncher.launch(
+        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+      )
+    } catch (t: Throwable) {
+      com.example.engine.CompressionLogger.w("CompressXUI", "Photo Picker unavailable; falling back to SAF", t)
+      launchSafPicker()
+    }
+  }
+
   // Storage Access Framework: Output directory picker
   val pickOutputFolderLauncher =
     rememberLauncherForActivityResult(
@@ -128,6 +142,15 @@ fun CompressXApp(
     ) { treeUri ->
       viewModel.onOutputFolderSelected(treeUri)
     }
+
+  val launchOutputFolderPicker = {
+    try {
+      pickOutputFolderLauncher.launch(null)
+    } catch (t: Throwable) {
+      com.example.engine.CompressionLogger.e("CompressXUI", "Failed launching SAF folder picker", t)
+      viewModel.reportMessage("Folder picker unavailable on this device.")
+    }
+  }
 
   // Android 13+ runtime notification permission (only requested when starting batch)
   val notificationPermissionLauncher =
@@ -145,7 +168,12 @@ fun CompressXApp(
       if (granted) {
         viewModel.startOrResumeBatch()
       } else {
-        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        try {
+          notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } catch (t: Throwable) {
+          com.example.engine.CompressionLogger.w("CompressXUI", "Notification permission launcher failed; continuing", t)
+          viewModel.startOrResumeBatch()
+        }
       }
     } else {
       viewModel.startOrResumeBatch()
@@ -155,13 +183,18 @@ fun CompressXApp(
   val shareOutputVideo: (VideoJobEntity) -> Unit = { job ->
     val uriStr = job.outputUri
     if (!uriStr.isNullOrBlank()) {
-      val shareIntent =
-        Intent(Intent.ACTION_SEND).apply {
-          type = "video/mp4"
-          putExtra(Intent.EXTRA_STREAM, Uri.parse(uriStr))
-          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-      context.startActivity(Intent.createChooser(shareIntent, "Share Compressed Video"))
+      try {
+        val shareIntent =
+          Intent(Intent.ACTION_SEND).apply {
+            type = "video/mp4"
+            putExtra(Intent.EXTRA_STREAM, Uri.parse(uriStr))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+          }
+        context.startActivity(Intent.createChooser(shareIntent, "Share Compressed Video"))
+      } catch (t: Throwable) {
+        com.example.engine.CompressionLogger.e("CompressXUI", "Failed sharing output video", t)
+        viewModel.reportMessage("Unable to share video: ${com.example.engine.CompressionLogger.formatUserErrorMessage(t)}")
+      }
     }
   }
 
@@ -288,8 +321,8 @@ fun CompressXApp(
             DashboardScreen(
               uiState = uiState,
               onPickVideos = launchPhotoPicker,
-              onPickSafVideos = { pickSafVideosLauncher.launch(arrayOf("video/*")) },
-              onPickOutputFolder = { pickOutputFolderLauncher.launch(null) },
+              onPickSafVideos = launchSafPicker,
+              onPickOutputFolder = launchOutputFolderPicker,
               onStartOrResume = startBatchWithNotificationCheck,
               onPause = { viewModel.pauseBatch() },
               onRetryFailed = { viewModel.retryAllFailed() },
@@ -307,7 +340,7 @@ fun CompressXApp(
               uiState = uiState,
               onSelectFilter = { viewModel.selectFilter(it) },
               onAddVideos = launchPhotoPicker,
-              onAddSafVideos = { pickSafVideosLauncher.launch(arrayOf("video/*")) },
+              onAddSafVideos = launchSafPicker,
               onStartOrResume = startBatchWithNotificationCheck,
               onPause = { viewModel.pauseBatch() },
               onMoveJob = { from, to, visible -> viewModel.moveJob(from, to, visible) },
@@ -339,7 +372,7 @@ fun CompressXApp(
               onSelectResolution = { viewModel.selectResolution(it) },
               onSelectCodec = { viewModel.selectCodec(it) },
               onChangeBitrateKbps = { viewModel.updateCustomBitrateKbps(it) },
-              onPickOutputFolder = { pickOutputFolderLauncher.launch(null) },
+              onPickOutputFolder = launchOutputFolderPicker,
               onResetOutputFolder = { viewModel.resetOutputFolderToDefault() },
               onTogglePreferHardware = { viewModel.setPreferHardware(it) },
               onToggleThermalProtection = { viewModel.setThermalProtection(it) },

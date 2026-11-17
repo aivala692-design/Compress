@@ -383,7 +383,7 @@ fun VideoJobCard(
             text = job.errorMessage,
             style = MaterialTheme.typography.bodyMedium,
             color = CrimsonError,
-            maxLines = 2,
+            maxLines = 4,
             overflow = TextOverflow.Ellipsis,
           )
         }

@@ -4,92 +4,152 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.example.CompressXApplication
-import com.example.data.VideoJobEntity
-import com.example.engine.CompressionPlanCalculator
-import com.example.model.JobStatus
+import com.example.engine.CompressionLogger
 import com.example.ui.components.FormatUtils
-import kotlinx.coroutines.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class CompressionForegroundService : Service() {
 
   companion object {
+    private const val TAG = "CompressXFGS"
     const val ACTION_START_OR_RESUME = "com.example.action.START_OR_RESUME"
     const val ACTION_PAUSE = "com.example.action.PAUSE"
     const val ACTION_CANCEL_ACTIVE = "com.example.action.CANCEL_ACTIVE"
+    private const val WAKELOCK_TAG = "CompressXStudio::BatchEncodingWakeLock"
+    private const val MAX_WAKELOCK_MS = 6 * 60 * 60 * 1000L // 6-hour safety cap
 
-    fun startQueue(context: Context) {
+    @Volatile var isRunning: Boolean = false
+      private set
+
+    fun startQueue(context: Context): Boolean {
       val intent =
         Intent(context, CompressionForegroundService::class.java).apply {
           action = ACTION_START_OR_RESUME
         }
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        context.startForegroundService(intent)
-      } else {
-        context.startService(intent)
+      return try {
+        ContextCompat.startForegroundService(context, intent)
+        true
+      } catch (t: Throwable) {
+        CompressionLogger.e(TAG, "startForegroundService failed; trying fallback path", t)
+        runCatching {
+          context.startService(intent)
+          true
+        }
+          .onFailure { fallbackErr ->
+            CompressionLogger.e(TAG, "startService fallback also rejected by OS", fallbackErr)
+          }
+          .getOrDefault(false)
       }
     }
 
     fun pauseQueue(context: Context) {
+      val app = context.applicationContext as? CompressXApplication
+      app?.batchQueueRunner?.requestPause()
+      app?.cancelInProcessFallback()
+      if (!isRunning) return
+
       val intent =
         Intent(context, CompressionForegroundService::class.java).apply { action = ACTION_PAUSE }
-      context.startService(intent)
+      runCatching { context.startService(intent) }
+        .onFailure { CompressionLogger.w(TAG, "pauseQueue startService failed safely", it) }
     }
 
     fun cancelActiveJob(context: Context) {
+      val app = context.applicationContext as? CompressXApplication
+      val activeId = app?.batchQueueRunner?.activeJobId
+      if (!isRunning) {
+        app?.compressionEngine?.cancelActive()
+        return
+      }
+
       val intent =
         Intent(context, CompressionForegroundService::class.java).apply {
           action = ACTION_CANCEL_ACTIVE
         }
-      context.startService(intent)
+      runCatching { context.startService(intent) }
+        .onFailure {
+          CompressionLogger.w(TAG, "cancelActiveJob startService failed; cancelling directly", it)
+          if (activeId != null) {
+            app?.cancelJobDirect(activeId)
+          } else {
+            app?.compressionEngine?.cancelActive()
+          }
+        }
     }
   }
 
   private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
   private var workerJob: Job? = null
-  @Volatile private var activeJobId: String? = null
-  @Volatile private var isPauseRequested: Boolean = false
+  private val foregroundActive = AtomicBoolean(false)
+  private var wakeLock: PowerManager.WakeLock? = null
+  @Volatile private var lastNotificationPostMs: Long = 0L
 
   override fun onCreate() {
     super.onCreate()
+    isRunning = true
     NotificationHelper.ensureChannels(this)
   }
 
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    isRunning = true
     when (intent?.action) {
-      ACTION_PAUSE -> handlePause()
-      ACTION_CANCEL_ACTIVE -> handleCancelActive()
+      ACTION_PAUSE -> {
+        handlePause()
+      }
+      ACTION_CANCEL_ACTIVE -> {
+        handleCancelActive()
+      }
       ACTION_START_OR_RESUME, null -> {
-        isPauseRequested = false
-        startForegroundSafely("Preparing compression queue...", 0, 0, 1)
+        val app = application as CompressXApplication
+        app.batchQueueRunner.resetPauseRequest()
+        val promoted = startForegroundSafely("Preparing compression queue...", 0, 0, 1)
+        if (!promoted) {
+          CompressionLogger.e(
+            TAG,
+            "Unable to promote foreground service on Android ${Build.VERSION.SDK_INT}; handoff to in-process runner",
+          )
+          app.startInProcessFallbackQueue()
+          stopSelf(startId)
+          return START_NOT_STICKY
+        }
         ensureWorkerRunning()
       }
     }
-    return START_STICKY
+    return START_NOT_STICKY
+  }
+
+  override fun onTimeout(startId: Int) {
+    CompressionLogger.w(TAG, "Foreground service timeout reached (API 34+); pausing cleanly")
+    handlePause()
   }
 
   override fun onTimeout(startId: Int, fgsType: Int) {
-    // Android 15+ mediaProcessing FGS 6-hour/24h quota timeout safeguard
+    CompressionLogger.w(
+      TAG,
+      "Foreground service mediaProcessing timeout reached (type=$fgsType); pausing cleanly",
+    )
     handlePause()
-    stopSelf()
   }
 
   override fun onDestroy() {
+    isRunning = false
+    foregroundActive.set(false)
+    releaseWakeLockSafely()
     val app = application as CompressXApplication
     app.compressionEngine.cancelActive()
     app.compressionEngine.cleanupOrphanedTempFiles()
@@ -103,7 +163,7 @@ class CompressionForegroundService : Service() {
     completed: Int,
     total: Int,
     statusNote: String? = null,
-  ) {
+  ): Boolean {
     val notification =
       NotificationHelper.buildProgressNotification(
         context = this,
@@ -113,30 +173,55 @@ class CompressionForegroundService : Service() {
         totalCount = total,
         statusNote = statusNote,
       )
-    val fgsType =
+
+    val candidateTypes =
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
+        listOf(
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING,
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+        )
       } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        listOf(ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
       } else {
-        0
+        listOf(0)
       }
 
-    ServiceCompat.startForeground(
-      this,
-      NotificationHelper.PROGRESS_NOTIFICATION_ID,
-      notification,
-      fgsType,
-    )
+    for (fgsType in candidateTypes) {
+      try {
+        ServiceCompat.startForeground(
+          this,
+          NotificationHelper.PROGRESS_NOTIFICATION_ID,
+          notification,
+          fgsType,
+        )
+        foregroundActive.set(true)
+        return true
+      } catch (t: Throwable) {
+        CompressionLogger.e(
+          TAG,
+          "ServiceCompat.startForeground failed for fgsType=$fgsType (SDK=${Build.VERSION.SDK_INT})",
+          t,
+        )
+      }
+    }
+    return false
   }
 
-  private fun updateNotification(
+  private fun updateNotificationThrottled(
     fileName: String,
     progress: Int,
     completed: Int,
     total: Int,
     statusNote: String? = null,
+    force: Boolean = false,
   ) {
+    if (!NotificationHelper.canPostNotifications(this)) return
+    val now = System.currentTimeMillis()
+    if (!force && progress in 1..99 && now - lastNotificationPostMs < 350L) {
+      return
+    }
+    lastNotificationPostMs = now
+
     val notification =
       NotificationHelper.buildProgressNotification(
         context = this,
@@ -149,7 +234,7 @@ class CompressionForegroundService : Service() {
     runCatching {
       NotificationManagerCompat.from(this)
         .notify(NotificationHelper.PROGRESS_NOTIFICATION_ID, notification)
-    }
+    }.onFailure { CompressionLogger.w(TAG, "Progress notification update failed", it) }
   }
 
   private fun ensureWorkerRunning() {
@@ -157,182 +242,94 @@ class CompressionForegroundService : Service() {
     workerJob =
       serviceScope.launch {
         val app = application as CompressXApplication
-        val repo = app.queueRepository
-        val prefs = app.preferencesRepository
-        val engine = app.compressionEngine
-        val guardrails = app.guardrailMonitor
-
-        // Recover any interrupted jobs before starting loop
-        repo.resetInterruptedProcessingJobs()
-        repo.resumeAllPausedJobs()
-        engine.cleanupOrphanedTempFiles()
-
-        var sessionCompleted = 0
-        var sessionFailed = 0
-        var sessionSavedBytes = 0L
-
-        while (!isPauseRequested) {
-          val nextJob: VideoJobEntity = repo.getNextQueuedJob() ?: break
-          val config = prefs.configFlow.first()
-
-          val totalPending = repo.countPendingOrActive().coerceAtLeast(1)
-          val totalBatch = sessionCompleted + totalPending
-
-          // Hardware & resource guardrails before encoding each video
-          val estimatedNeededBytes =
-            maxOf(
-              500L * 1024L * 1024L,
-              (nextJob.originalSizeBytes * 1.1).toLong(),
+        acquireWakeLockSafely()
+        try {
+          val summary =
+            app.batchQueueRunner.runBatch(
+              progressScope = serviceScope,
+              onJobStarted = { fileName, completed, total ->
+                updateNotificationThrottled(fileName, 0, completed, total, force = true)
+              },
+              onProgressChanged = { fileName, pct, completed, total ->
+                updateNotificationThrottled(fileName, pct, completed, total, force = pct == 100)
+              },
+              onStatusNote = { fileName, completed, total, note ->
+                updateNotificationThrottled(fileName, 0, completed, total, statusNote = note, force = true)
+              },
             )
-          val guardrail = guardrails.sample(estimatedNeededBytes)
 
-          if (guardrail.isLowStorage) {
-            repo.markFailed(
-              nextJob.id,
-              "Insufficient free storage (${FormatUtils.formatBytes(guardrail.availableStorageBytes)} free).",
+          if (!summary.wasPaused && (summary.completedCount > 0 || summary.failedCount > 0)) {
+            NotificationHelper.postCompletionNotification(
+              context = this@CompressionForegroundService,
+              completedCount = summary.completedCount,
+              failedCount = summary.failedCount,
+              savedFormatted = FormatUtils.formatBytes(summary.savedBytes),
             )
-            sessionFailed++
-            continue
           }
-
-          if (config.pauseOnLowBattery && guardrail.isLowBattery) {
-            isPauseRequested = true
-            repo.updateStatusAndProgress(nextJob.id, JobStatus.PAUSED, 0)
-            updateNotification(
-              fileName = nextJob.fileName,
-              progress = 0,
-              completed = sessionCompleted,
-              total = totalBatch,
-              statusNote = "Paused: low battery (${guardrail.batteryPercent}%)",
-            )
-            break
-          }
-
-          if (config.thermalProtectionEnabled && guardrail.isThrottled) {
-            updateNotification(
-              fileName = nextJob.fileName,
-              progress = 0,
-              completed = sessionCompleted,
-              total = totalBatch,
-              statusNote = "Thermal cooldown active — waiting 15s...",
-            )
-            delay(15_000L)
-          }
-
-          activeJobId = nextJob.id
-          repo.updateStatusAndProgress(nextJob.id, JobStatus.PROCESSING, 0)
-          updateNotification(nextJob.fileName, 0, sessionCompleted, totalBatch)
-
-          val plan =
-            CompressionPlanCalculator.buildPlan(
-              sourceWidth = nextJob.width,
-              sourceHeight = nextJob.height,
-              sourceRotation = nextJob.rotation,
-              sourceBitrateBps = nextJob.sourceBitrateBps,
-              preset = nextJob.preset,
-              targetResolution = nextJob.targetResolution,
-              targetCodec = nextJob.targetCodec,
-              customBitrateKbps = nextJob.customBitrateKbps,
-            )
-
-          try {
-            var lastPostedProgress = -1
-            val result =
-              engine.compressVideo(
-                jobId = nextJob.id,
-                sourceUri = Uri.parse(nextJob.sourceUri),
-                originalFileName = nextJob.fileName,
-                plan = plan,
-                preferHardware = config.preferHardwareAcceleration,
-                customOutputTreeUri = config.outputTreeUri,
-                onProgress = { pct ->
-                  if (pct != lastPostedProgress) {
-                    lastPostedProgress = pct
-                    serviceScope.launch { repo.updateProgress(nextJob.id, pct) }
-                    updateNotification(nextJob.fileName, pct, sessionCompleted, totalBatch)
-                  }
-                },
-              )
-
-            repo.markCompleted(
-              id = nextJob.id,
-              outputUri = result.outputUri.toString(),
-              outputFileName = result.outputFileName,
-              outputSizeBytes = result.outputSizeBytes,
-              usedHardwareEncoder = result.usedHardwareEncoder,
-              encoderName = result.encoderName,
-            )
-            sessionCompleted++
-            sessionSavedBytes += (nextJob.originalSizeBytes - result.outputSizeBytes).coerceAtLeast(0L)
-          } catch (cancelled: CancellationException) {
-            if (isPauseRequested) {
-              repo.updateStatusAndProgress(nextJob.id, JobStatus.PAUSED, 0)
-            } else {
-              val latest = repo.getJobById(nextJob.id)
-              if (latest?.status == JobStatus.PROCESSING) {
-                repo.updateStatusAndProgress(nextJob.id, JobStatus.CANCELLED, 0)
-              }
-            }
-            if (isPauseRequested) break
-          } catch (t: Throwable) {
-            if (isPauseRequested) {
-              repo.updateStatusAndProgress(nextJob.id, JobStatus.PAUSED, 0)
-              break
-            } else {
-              val latest = repo.getJobById(nextJob.id)
-              if (latest?.status != JobStatus.CANCELLED) {
-                repo.markFailed(
-                  nextJob.id,
-                  t.localizedMessage ?: "Compression failed on device codec",
-                )
-                sessionFailed++
-              }
-            }
-          } finally {
-            activeJobId = null
-          }
+        } catch (t: Throwable) {
+          CompressionLogger.e(TAG, "Unexpected exception in foreground service batch loop", t)
+        } finally {
+          releaseWakeLockSafely()
+          isRunning = false
+          stopForegroundSafely()
+          stopSelf()
         }
-
-        if (!isPauseRequested && (sessionCompleted > 0 || sessionFailed > 0)) {
-          NotificationHelper.postCompletionNotification(
-            context = this@CompressionForegroundService,
-            completedCount = sessionCompleted,
-            failedCount = sessionFailed,
-            savedFormatted = FormatUtils.formatBytes(sessionSavedBytes),
-          )
-        }
-
-        ServiceCompat.stopForeground(
-          this@CompressionForegroundService,
-          ServiceCompat.STOP_FOREGROUND_REMOVE,
-        )
-        stopSelf()
       }
   }
 
   private fun handlePause() {
-    isPauseRequested = true
     val app = application as CompressXApplication
-    app.compressionEngine.cancelActive()
+    app.batchQueueRunner.requestPause()
     serviceScope.launch {
-      app.queueRepository.pauseActiveProcessingJobs()
+      runCatching { app.queueRepository.pauseActiveProcessingJobs() }
+        .onFailure { CompressionLogger.e(TAG, "Failed pausing active jobs in DB", it) }
       workerJob?.cancel()
-      ServiceCompat.stopForeground(
-        this@CompressionForegroundService,
-        ServiceCompat.STOP_FOREGROUND_REMOVE,
-      )
+      stopForegroundSafely()
+      isRunning = false
       stopSelf()
     }
   }
 
   private fun handleCancelActive() {
-    val targetId = activeJobId
     val app = application as CompressXApplication
+    val targetId = app.batchQueueRunner.activeJobId
     serviceScope.launch {
       if (targetId != null) {
-        app.queueRepository.cancelJob(targetId)
+        runCatching { app.queueRepository.cancelJob(targetId) }
+          .onFailure { CompressionLogger.e(TAG, "Failed cancelling job $targetId", it) }
       }
       app.compressionEngine.cancelActive()
+      if (workerJob?.isActive != true) {
+        stopForegroundSafely()
+        isRunning = false
+        stopSelf()
+      }
     }
+  }
+
+  private fun stopForegroundSafely() {
+    if (!foregroundActive.getAndSet(false)) return
+    runCatching {
+      ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+    }.onFailure { CompressionLogger.w(TAG, "stopForeground failed safely", it) }
+  }
+
+  private fun acquireWakeLockSafely() {
+    runCatching {
+      if (wakeLock?.isHeld == true) return
+      val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+      wakeLock =
+        pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG).apply {
+          setReferenceCounted(false)
+          acquire(MAX_WAKELOCK_MS)
+        }
+    }.onFailure { CompressionLogger.w(TAG, "Unable to acquire partial wake lock", it) }
+  }
+
+  private fun releaseWakeLockSafely() {
+    runCatching {
+      wakeLock?.let { if (it.isHeld) it.release() }
+      wakeLock = null
+    }.onFailure { CompressionLogger.w(TAG, "Unable to release wake lock", it) }
   }
 }

@@ -71,6 +71,21 @@ object CodecCapabilityInspector {
       name.contains("sw")
   }
 
+  fun filterSoftwareEncoders(infos: List<MediaCodecInfo>): List<MediaCodecInfo> =
+    infos.filter { isSoftwareCodec(it) }
+
+  fun findSoftwareEncoderInfos(mimeType: String): List<MediaCodecInfo> {
+    val codecInfos =
+      runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.toList() }
+        .onFailure { CompressionLogger.w("CompressXCodec", "MediaCodecList query failed", it) }
+        .getOrDefault(emptyList())
+    return codecInfos.filter { info ->
+      info.isEncoder &&
+        isSoftwareCodec(info) &&
+        info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) }
+    }
+  }
+
   private fun isHardwareCodec(info: MediaCodecInfo, isSoftware: Boolean): Boolean {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
       return info.isHardwareAccelerated

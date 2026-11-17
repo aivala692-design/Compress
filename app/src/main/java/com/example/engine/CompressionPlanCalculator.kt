@@ -116,10 +116,16 @@ object CompressionPlanCalculator {
 
   fun buildCompressedFileName(originalName: String): String {
     val clean = originalName.trim().ifEmpty { "video_${System.currentTimeMillis()}.mp4" }
-    val base = clean.substringBeforeLast('.', clean)
-    val sanitizedBase =
-      if (base.endsWith("_compressed")) base else "${base}_compressed"
-    return "$sanitizedBase.mp4"
+    val rawBase = clean.substringBeforeLast('.', clean)
+    val safeBase =
+      rawBase
+        .replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1F]"), "_")
+        .replace(Regex("_+"), "_")
+        .trim(' ', '.', '_')
+        .ifEmpty { "video_${System.currentTimeMillis()}" }
+    val finalBase =
+      if (safeBase.endsWith("_compressed")) safeBase else "${safeBase}_compressed"
+    return "$finalBase.mp4"
   }
 
   fun estimateOutputSizeBytes(durationMs: Long, videoBitrateBps: Int, audioBitrateBps: Int): Long {
