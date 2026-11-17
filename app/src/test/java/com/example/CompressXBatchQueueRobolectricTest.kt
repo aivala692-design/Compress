@@ -133,6 +133,13 @@ class CompressXBatchQueueRobolectricTest {
       )
     val intent = contract.createIntent(context, request)
     assertEquals("video/*", intent.type)
-    assertTrue(intent.getBooleanExtra(android.content.Intent.EXTRA_ALLOW_MULTIPLE, false))
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+      assertTrue(
+        intent.hasExtra(android.provider.MediaStore.EXTRA_PICK_IMAGES_MAX) ||
+          intent.getBooleanExtra(android.content.Intent.EXTRA_ALLOW_MULTIPLE, false)
+      )
+    } else {
+      assertTrue(intent.getBooleanExtra(android.content.Intent.EXTRA_ALLOW_MULTIPLE, false))
+    }
   }
 }
