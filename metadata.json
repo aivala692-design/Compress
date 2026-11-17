@@ -1,0 +1,6 @@
+{
+  "name": "CompressX Studio",
+  "description": "Offline batch video compression studio for Android using hardware-accelerated MediaCodec and Media3 Transformer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
