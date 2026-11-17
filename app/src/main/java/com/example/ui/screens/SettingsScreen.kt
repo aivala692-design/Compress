@@ -52,6 +52,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.model.CompressionPreset
+import com.example.model.OutputMode
 import com.example.model.TargetResolution
 import com.example.model.VideoCodec
 import com.example.ui.StudioUiState
@@ -74,6 +75,7 @@ fun SettingsScreen(
   onSelectResolution: (TargetResolution) -> Unit,
   onSelectCodec: (VideoCodec) -> Unit,
   onChangeBitrateKbps: (Int) -> Unit,
+  onSelectOutputMode: (OutputMode) -> Unit,
   onPickOutputFolder: () -> Unit,
   onResetOutputFolder: () -> Unit,
   onTogglePreferHardware: (Boolean) -> Unit,
@@ -287,9 +289,72 @@ fun SettingsScreen(
         }
       }
 
+      // Output Storage Mode (Replace Original vs Keep Original)
+      item {
+        SettingsCard(title = "Output File Mode") {
+          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutputMode.entries.forEach { mode ->
+              val selected =
+                when (mode) {
+                  OutputMode.REPLACE_ORIGINAL -> config.isReplaceOriginalActive
+                  OutputMode.KEEP_ORIGINAL -> !config.isReplaceOriginalActive
+                }
+              val needsConsent =
+                mode == OutputMode.REPLACE_ORIGINAL && !config.replaceOriginalConsentGranted
+              Surface(
+                modifier =
+                  Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { onSelectOutputMode(mode) }
+                    .testTag("settings_output_mode_${mode.name}"),
+                color = if (selected) Color(0xFF0A333D) else StudioSurfaceHighlight,
+                shape = RoundedCornerShape(12.dp),
+                border =
+                  androidx.compose.foundation.BorderStroke(
+                    1.dp,
+                    if (selected) CyanPrimary else StudioBorder,
+                  ),
+              ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                  Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                    Text(
+                      text = mode.label,
+                      style = MaterialTheme.typography.titleMedium,
+                      color = if (selected) CyanPrimary else MaterialTheme.colorScheme.onSurface,
+                      modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                      text =
+                        when {
+                          selected -> "ACTIVE"
+                          needsConsent -> "ENABLE"
+                          else -> "SELECT"
+                        },
+                      style = MaterialTheme.typography.labelSmall,
+                      color = if (selected) EmeraldSuccess else CyanPrimary,
+                    )
+                  }
+                  Spacer(modifier = Modifier.height(4.dp))
+                  Text(
+                    text = mode.subtitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextSecondary,
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+
       // Output Folder Selection
       item {
-        SettingsCard(title = "Output Directory") {
+        SettingsCard(title = "Output Directory (Keep Original / Copy Fallback)") {
           Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -309,7 +374,12 @@ fun SettingsScreen(
                 overflow = TextOverflow.Ellipsis,
               )
               Text(
-                text = "Originals are never overwritten (_compressed.mp4)",
+                text =
+                  if (config.isReplaceOriginalActive) {
+                    "Used when you tap Save Copy instead of replacing original"
+                  } else {
+                    "Originals are preserved untouched (_compressed.mp4)"
+                  },
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextSecondary,
               )

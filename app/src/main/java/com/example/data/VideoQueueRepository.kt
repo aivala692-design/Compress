@@ -5,9 +5,12 @@ import android.content.Intent
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
+import com.example.engine.CompressionLogger
 import com.example.model.BatchSummaryStats
 import com.example.model.JobStatus
+import com.example.model.OutputMode
 import com.example.model.VideoCompressionConfig
+import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -30,13 +33,23 @@ class VideoQueueRepository(
       if (uris.isEmpty()) return@withContext 0
       var nextSort = dao.getMaxSortOrder() + 1
       val jobs = mutableListOf<VideoJobEntity>()
+      val effectiveMode =
+        if (config.isReplaceOriginalActive) OutputMode.REPLACE_ORIGINAL else OutputMode.KEEP_ORIGINAL
 
       for (uri in uris) {
+        // Persistable permission works for SAF documents and is ignored for one-time Photo Picker URIs
         runCatching {
           context.contentResolver.takePersistableUriPermission(
             uri,
-            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
           )
+        }.onFailure {
+          runCatching {
+            context.contentResolver.takePersistableUriPermission(
+              uri,
+              Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+          }
         }
         val probed = probeVideoMetadata(uri)
         jobs +=
@@ -57,16 +70,18 @@ class VideoQueueRepository(
             targetResolution = config.resolution,
             targetCodec = config.codec,
             customBitrateKbps = config.customBitrateKbps,
+            outputMode = effectiveMode,
             errorMessage = probed.errorMessage,
           )
       }
 
-      // Chunk inserts cleanly so even 200+ item batches stay fast and transactional
       jobs.chunked(50).forEach { chunk -> dao.insertJobs(chunk) }
       jobs.size
     }
 
   suspend fun getNextQueuedJob(): VideoJobEntity? = dao.getNextQueuedJob()
+
+  suspend fun getAwaitingApprovalJobs(): List<VideoJobEntity> = dao.getAwaitingApprovalJobs()
 
   suspend fun getJobById(id: String): VideoJobEntity? = dao.getJobById(id)
 
@@ -77,8 +92,27 @@ class VideoQueueRepository(
 
   suspend fun updateProgress(id: String, progress: Int) = dao.updateProgress(id, progress)
 
+  suspend fun markAwaitingApproval(
+    id: String,
+    stagedTempPath: String,
+    outputSizeBytes: Long,
+    usedHardwareEncoder: Boolean,
+    encoderName: String,
+  ) =
+    dao.markAwaitingApproval(
+      id = id,
+      stagedTempPath = stagedTempPath,
+      outputSizeBytes = outputSizeBytes,
+      usedHardwareEncoder = usedHardwareEncoder,
+      encoderName = encoderName,
+    )
+
+  suspend fun markAwaitingApprovalError(id: String, errorMessage: String) =
+    dao.markAwaitingApprovalError(id, errorMessage)
+
   suspend fun markCompleted(
     id: String,
+    replacedOriginal: Boolean,
     outputUri: String,
     outputFileName: String,
     outputSizeBytes: Long,
@@ -87,6 +121,7 @@ class VideoQueueRepository(
   ) =
     dao.markCompleted(
       id = id,
+      replacedOriginal = replacedOriginal,
       outputUri = outputUri,
       outputFileName = outputFileName,
       outputSizeBytes = outputSizeBytes,
@@ -95,8 +130,14 @@ class VideoQueueRepository(
       completedAt = System.currentTimeMillis(),
     )
 
-  suspend fun markFailed(id: String, errorMessage: String) =
+  suspend fun markFailed(id: String, errorMessage: String) {
+    val existing = dao.getJobById(id)
+    existing?.stagedTempPath?.let { path ->
+      runCatching { File(path).delete() }
+        .onFailure { CompressionLogger.w("CompressXRepo", "Cleanup of staged file failed", it) }
+    }
     dao.markFailed(id, errorMessage, System.currentTimeMillis())
+  }
 
   suspend fun reorderJobs(orderedIds: List<String>) = dao.reorderJobs(orderedIds)
 
@@ -110,22 +151,45 @@ class VideoQueueRepository(
 
   suspend fun retryJob(id: String) = dao.retryJob(id)
 
-  suspend fun cancelJob(id: String) =
+  suspend fun cancelJob(id: String) {
+    val existing = dao.getJobById(id)
+    existing?.stagedTempPath?.let { path ->
+      runCatching { File(path).delete() }
+    }
     dao.updateStatusAndProgress(id, JobStatus.CANCELLED, 0)
+  }
 
-  suspend fun deleteJob(id: String) = dao.deleteJob(id)
+  suspend fun deleteJob(id: String) {
+    val existing = dao.getJobById(id)
+    existing?.stagedTempPath?.let { path ->
+      runCatching { File(path).delete() }
+    }
+    dao.deleteJob(id)
+  }
 
   suspend fun clearCompletedAndCancelled() = dao.clearCompletedAndCancelled()
 
-  suspend fun clearAllNonProcessing() = dao.clearAllNonProcessing()
+  suspend fun clearAllNonProcessing() {
+    dao.getAwaitingApprovalJobs().forEach { job ->
+      job.stagedTempPath?.let { path -> runCatching { File(path).delete() } }
+    }
+    dao.clearAllNonProcessing()
+  }
 
-  suspend fun clearAll() = dao.clearAllJobs()
+  suspend fun clearAll() {
+    dao.getAwaitingApprovalJobs().forEach { job ->
+      job.stagedTempPath?.let { path -> runCatching { File(path).delete() } }
+    }
+    dao.clearAllJobs()
+  }
 
   fun computeStats(jobs: List<VideoJobEntity>): BatchSummaryStats {
     var queued = 0
     var processing = 0
     var paused = 0
+    var awaitingApproval = 0
     var completed = 0
+    var replaced = 0
     var failed = 0
     var originalCompleted = 0L
     var outputCompleted = 0L
@@ -142,8 +206,13 @@ class VideoQueueRepository(
           paused++
           activeProgressSum += job.progressPercent
         }
+        JobStatus.AWAITING_APPROVAL -> {
+          awaitingApproval++
+          activeProgressSum += 95
+        }
         JobStatus.COMPLETED -> {
           completed++
+          if (job.replacedOriginal) replaced++
           originalCompleted += job.originalSizeBytes
           outputCompleted += job.outputSizeBytes
           activeProgressSum += 100
@@ -153,7 +222,7 @@ class VideoQueueRepository(
       }
     }
 
-    val totalWorkItems = queued + processing + paused + completed
+    val totalWorkItems = queued + processing + paused + awaitingApproval + completed
     val overallProgress =
       if (totalWorkItems > 0) (activeProgressSum / totalWorkItems).coerceIn(0, 100) else 0
 
@@ -161,7 +230,9 @@ class VideoQueueRepository(
       queuedCount = queued,
       processingCount = processing,
       pausedCount = paused,
+      awaitingApprovalCount = awaitingApproval,
       completedCount = completed,
+      replacedCount = replaced,
       failedCount = failed,
       totalOriginalBytesCompleted = originalCompleted,
       totalOutputBytesCompleted = outputCompleted,

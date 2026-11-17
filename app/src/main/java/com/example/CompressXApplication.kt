@@ -7,6 +7,7 @@ import com.example.data.VideoQueueRepository
 import com.example.engine.CodecCapabilityInspector
 import com.example.engine.CompressionLogger
 import com.example.engine.DeviceGuardrailMonitor
+import com.example.engine.MediaReplacementManager
 import com.example.engine.OutputStorageWriter
 import com.example.engine.VideoCompressionEngine
 import com.example.model.CodecCapabilities
@@ -30,6 +31,9 @@ class CompressXApplication : Application() {
     VideoQueueRepository(this, database.videoJobDao())
   }
   val outputStorageWriter: OutputStorageWriter by lazy { OutputStorageWriter(this) }
+  val mediaReplacementManager: MediaReplacementManager by lazy {
+    MediaReplacementManager(this, outputStorageWriter)
+  }
   val compressionEngine: VideoCompressionEngine by lazy {
     VideoCompressionEngine(this, outputStorageWriter)
   }
@@ -75,10 +79,14 @@ class CompressXApplication : Application() {
               onProgressChanged = { _, _, _, _ -> },
               onStatusNote = { _, _, _, _ -> },
             )
-          if (!summary.wasPaused && (summary.completedCount > 0 || summary.failedCount > 0)) {
+          if (
+            !summary.wasPaused &&
+              (summary.completedCount > 0 || summary.awaitingApprovalCount > 0 || summary.failedCount > 0)
+          ) {
             NotificationHelper.postCompletionNotification(
               context = this@CompressXApplication,
               completedCount = summary.completedCount,
+              awaitingApprovalCount = summary.awaitingApprovalCount,
               failedCount = summary.failedCount,
               savedFormatted = FormatUtils.formatBytes(summary.savedBytes),
             )

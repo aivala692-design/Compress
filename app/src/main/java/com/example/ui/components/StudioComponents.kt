@@ -32,10 +32,14 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.PauseCircle
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.VideoFile
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -191,13 +195,19 @@ fun VideoThumbnailBox(
 }
 
 @Composable
-fun StatusBadgeChip(status: JobStatus) {
+fun StatusBadgeChip(status: JobStatus, replacedOriginal: Boolean = false) {
   val (label, tint, bg) =
     when (status) {
       JobStatus.QUEUED -> Triple("QUEUED", TextSecondary, StudioSurfaceHighlight)
       JobStatus.PROCESSING -> Triple("ENCODING", CyanPrimary, Color(0xFF0A333D))
       JobStatus.PAUSED -> Triple("PAUSED", AmberWarning, Color(0xFF3A280A))
-      JobStatus.COMPLETED -> Triple("SAVED", EmeraldSuccess, Color(0xFF0A3327))
+      JobStatus.AWAITING_APPROVAL -> Triple("APPROVE", AmberWarning, Color(0xFF3A280A))
+      JobStatus.COMPLETED ->
+        if (replacedOriginal) {
+          Triple("REPLACED", EmeraldSuccess, Color(0xFF0A3327))
+        } else {
+          Triple("SAVED", EmeraldSuccess, Color(0xFF0A3327))
+        }
       JobStatus.FAILED -> Triple("FAILED", CrimsonError, Color(0xFF3C1317))
       JobStatus.CANCELLED -> Triple("CANCELLED", TextMuted, StudioSurfaceHighlight)
     }
@@ -228,6 +238,8 @@ fun VideoJobCard(
   onCancel: () -> Unit,
   onRetry: () -> Unit,
   onDelete: () -> Unit,
+  onApproveReplace: ((String) -> Unit)? = null,
+  onSaveCopyInstead: ((String) -> Unit)? = null,
   onPreviewOutput: ((VideoJobEntity) -> Unit)? = null,
   onShareOutput: ((VideoJobEntity) -> Unit)? = null,
   modifier: Modifier = Modifier,
@@ -236,6 +248,7 @@ fun VideoJobCard(
     when {
       isDragging -> CyanPrimary
       job.status == JobStatus.PROCESSING -> CyanPrimary.copy(alpha = 0.65f)
+      job.status == JobStatus.AWAITING_APPROVAL -> AmberWarning.copy(alpha = 0.65f)
       job.status == JobStatus.FAILED -> CrimsonError.copy(alpha = 0.5f)
       else -> StudioBorder
     }
@@ -289,7 +302,7 @@ fun VideoJobCard(
               overflow = TextOverflow.Ellipsis,
               modifier = Modifier.weight(1f).padding(end = 8.dp),
             )
-            StatusBadgeChip(status = job.status)
+            StatusBadgeChip(status = job.status, replacedOriginal = job.replacedOriginal)
           }
 
           Spacer(modifier = Modifier.height(4.dp))
@@ -313,13 +326,16 @@ fun VideoJobCard(
               style = MaterialTheme.typography.labelSmall,
               color = TextSecondary,
             )
-            if (job.status == JobStatus.COMPLETED && job.outputSizeBytes > 0L) {
+            if (
+              (job.status == JobStatus.COMPLETED || job.status == JobStatus.AWAITING_APPROVAL) &&
+                job.outputSizeBytes > 0L
+            ) {
               val reduction =
                 FormatUtils.formatReductionPercent(job.originalSizeBytes, job.outputSizeBytes)
               Text(
                 text = " → ${FormatUtils.formatBytes(job.outputSizeBytes)}",
                 style = MaterialTheme.typography.labelSmall,
-                color = EmeraldSuccess,
+                color = if (job.status == JobStatus.AWAITING_APPROVAL) AmberWarning else EmeraldSuccess,
               )
               if (reduction > 0) {
                 Spacer(modifier = Modifier.width(6.dp))
@@ -448,6 +464,61 @@ fun VideoJobCard(
               Icon(
                 imageVector = Icons.Default.Close,
                 contentDescription = "Cancel job",
+                tint = CrimsonError,
+              )
+            }
+          }
+          JobStatus.AWAITING_APPROVAL -> {
+            if (onPreviewOutput != null) {
+              IconButton(
+                onClick = { onPreviewOutput(job) },
+                modifier = Modifier.size(48.dp).testTag("preview_staged_${job.id}"),
+              ) {
+                Icon(
+                  imageVector = Icons.Default.PlayArrow,
+                  contentDescription = "Preview verified compressed video",
+                  tint = CyanPrimary,
+                )
+              }
+            }
+            if (onSaveCopyInstead != null) {
+              IconButton(
+                onClick = { onSaveCopyInstead(job.id) },
+                modifier = Modifier.size(48.dp).testTag("save_copy_${job.id}"),
+              ) {
+                Icon(
+                  imageVector = Icons.Default.SaveAlt,
+                  contentDescription = "Save compressed copy instead",
+                  tint = TextSecondary,
+                )
+              }
+            }
+            if (onApproveReplace != null) {
+              FilledTonalButton(
+                onClick = { onApproveReplace(job.id) },
+                colors =
+                  ButtonDefaults.filledTonalButtonColors(
+                    containerColor = EmeraldSuccess.copy(alpha = 0.2f),
+                    contentColor = EmeraldSuccess,
+                  ),
+                modifier = Modifier.height(40.dp).testTag("approve_replace_${job.id}"),
+              ) {
+                Icon(
+                  imageVector = Icons.Default.SwapHoriz,
+                  contentDescription = null,
+                  modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Replace", style = MaterialTheme.typography.labelMedium)
+              }
+            }
+            IconButton(
+              onClick = onDelete,
+              modifier = Modifier.size(48.dp).testTag("discard_staged_${job.id}"),
+            ) {
+              Icon(
+                imageVector = Icons.Default.Close,
+                contentDescription = "Discard compressed file and keep original",
                 tint = CrimsonError,
               )
             }

@@ -24,6 +24,7 @@ import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import com.example.model.CodecCapabilities
 import com.example.model.CompressionPlan
+import com.example.model.OutputMode
 import com.example.model.VideoCodec
 import com.google.common.collect.ImmutableList
 import java.io.File
@@ -44,6 +45,7 @@ data class CompressionExecutionResult(
   val outputSizeBytes: Long,
   val usedHardwareEncoder: Boolean,
   val encoderName: String,
+  val stagedTempPath: String? = null,
 )
 
 @OptIn(UnstableApi::class)
@@ -94,12 +96,15 @@ class VideoCompressionEngine(
     }
   }
 
+  fun stagedDirectory(): File = File(context.filesDir, "compressx_staged").apply { mkdirs() }
+
   suspend fun compressVideo(
     jobId: String,
     sourceUri: Uri,
     originalFileName: String,
     plan: CompressionPlan,
     preferHardware: Boolean,
+    outputMode: OutputMode,
     customOutputTreeUri: String?,
     onProgress: (Int) -> Unit,
   ): CompressionExecutionResult {
@@ -188,18 +193,6 @@ class VideoCompressionEngine(
         verifyEncodedOutputPlayable(tempOutputFile)
       }
 
-      val saved =
-        withContext(Dispatchers.IO) {
-          outputStorageWriter.writeTempFileToDestination(
-            tempFile = tempOutputFile,
-            originalFileName = originalFileName,
-            customTreeUriString = customOutputTreeUri,
-          )
-        }
-
-      // Verify saved MediaStore/SAF destination URI is readable and non-empty
-      withContext(Dispatchers.IO) { verifyOutputUriReadable(saved.outputUri) }
-
       val encoderName =
         finalExport.videoEncoderName
           ?: if (usedAttemptSpec.forceSoftwareEncoder) {
@@ -221,6 +214,46 @@ class VideoCompressionEngine(
             capabilities.hasAnyHardwareEncoder
         }
 
+      if (outputMode == OutputMode.REPLACE_ORIGINAL) {
+        val stagedFile =
+          withContext(Dispatchers.IO) {
+            val dest = File(stagedDirectory(), "${jobId}.staged.mp4")
+            if (dest.exists()) dest.delete()
+            if (!tempOutputFile.renameTo(dest)) {
+              tempOutputFile.copyTo(dest, overwrite = true)
+              tempOutputFile.delete()
+            }
+            verifyEncodedOutputPlayable(dest)
+            dest
+          }
+
+        CompressionLogger.i(
+          TAG,
+          "Job $jobId verified & staged for replacement [${usedAttemptSpec.label}]: encoder=$encoderName (hw=$isHw), size=${stagedFile.length()} B",
+        )
+
+        return CompressionExecutionResult(
+          outputUri = Uri.fromFile(stagedFile),
+          outputFileName = originalFileName,
+          outputSizeBytes = stagedFile.length(),
+          usedHardwareEncoder = isHw,
+          encoderName = encoderName,
+          stagedTempPath = stagedFile.absolutePath,
+        )
+      }
+
+      val saved =
+        withContext(Dispatchers.IO) {
+          outputStorageWriter.writeTempFileToDestination(
+            tempFile = tempOutputFile,
+            originalFileName = originalFileName,
+            customTreeUriString = customOutputTreeUri,
+          )
+        }
+
+      // Verify saved MediaStore/SAF destination URI is readable and non-empty
+      withContext(Dispatchers.IO) { verifyOutputUriReadable(saved.outputUri) }
+
       CompressionLogger.i(
         TAG,
         "Job $jobId completed [${usedAttemptSpec.label}]: encoder=$encoderName (hw=$isHw), output=${saved.outputFileName} (${saved.outputSizeBytes} B)",
@@ -232,6 +265,7 @@ class VideoCompressionEngine(
         outputSizeBytes = saved.outputSizeBytes,
         usedHardwareEncoder = isHw,
         encoderName = encoderName,
+        stagedTempPath = null,
       )
     } finally {
       if (tempOutputFile.exists()) {

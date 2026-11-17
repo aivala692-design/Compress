@@ -18,6 +18,9 @@ interface VideoJobDao {
   @Query("SELECT * FROM video_jobs WHERE status = 'COMPLETED' ORDER BY completedAt DESC")
   fun observeCompletedHistory(): Flow<List<VideoJobEntity>>
 
+  @Query("SELECT * FROM video_jobs WHERE status = 'AWAITING_APPROVAL' ORDER BY sortOrder ASC, createdAt ASC")
+  suspend fun getAwaitingApprovalJobs(): List<VideoJobEntity>
+
   @Query("SELECT * FROM video_jobs WHERE id = :id LIMIT 1")
   suspend fun getJobById(id: String): VideoJobEntity?
 
@@ -52,8 +55,41 @@ interface VideoJobDao {
   @Query(
     """
     UPDATE video_jobs
+    SET status = 'AWAITING_APPROVAL',
+        progressPercent = 100,
+        stagedTempPath = :stagedTempPath,
+        outputSizeBytes = :outputSizeBytes,
+        usedHardwareEncoder = :usedHardwareEncoder,
+        encoderName = :encoderName,
+        errorMessage = NULL
+    WHERE id = :id
+    """
+  )
+  suspend fun markAwaitingApproval(
+    id: String,
+    stagedTempPath: String,
+    outputSizeBytes: Long,
+    usedHardwareEncoder: Boolean,
+    encoderName: String,
+  )
+
+  @Query(
+    """
+    UPDATE video_jobs
+    SET status = 'AWAITING_APPROVAL',
+        errorMessage = :errorMessage
+    WHERE id = :id
+    """
+  )
+  suspend fun markAwaitingApprovalError(id: String, errorMessage: String)
+
+  @Query(
+    """
+    UPDATE video_jobs
     SET status = 'COMPLETED',
         progressPercent = 100,
+        replacedOriginal = :replacedOriginal,
+        stagedTempPath = NULL,
         outputUri = :outputUri,
         outputFileName = :outputFileName,
         outputSizeBytes = :outputSizeBytes,
@@ -66,6 +102,7 @@ interface VideoJobDao {
   )
   suspend fun markCompleted(
     id: String,
+    replacedOriginal: Boolean,
     outputUri: String,
     outputFileName: String,
     outputSizeBytes: Long,
@@ -78,6 +115,7 @@ interface VideoJobDao {
     """
     UPDATE video_jobs
     SET status = 'FAILED',
+        stagedTempPath = NULL,
         errorMessage = :errorMessage,
         completedAt = :completedAt
     WHERE id = :id
@@ -94,10 +132,10 @@ interface VideoJobDao {
   @Query("UPDATE video_jobs SET status = 'PAUSED' WHERE status = 'PROCESSING'")
   suspend fun pauseActiveProcessingJobs()
 
-  @Query("UPDATE video_jobs SET status = 'QUEUED', progressPercent = 0, errorMessage = NULL WHERE status IN ('FAILED', 'CANCELLED')")
+  @Query("UPDATE video_jobs SET status = 'QUEUED', progressPercent = 0, stagedTempPath = NULL, errorMessage = NULL WHERE status IN ('FAILED', 'CANCELLED')")
   suspend fun retryAllFailedJobs()
 
-  @Query("UPDATE video_jobs SET status = 'QUEUED', progressPercent = 0, errorMessage = NULL WHERE id = :id")
+  @Query("UPDATE video_jobs SET status = 'QUEUED', progressPercent = 0, stagedTempPath = NULL, errorMessage = NULL WHERE id = :id")
   suspend fun retryJob(id: String)
 
   @Query("DELETE FROM video_jobs WHERE id = :id")

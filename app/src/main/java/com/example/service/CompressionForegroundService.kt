@@ -258,10 +258,14 @@ class CompressionForegroundService : Service() {
               },
             )
 
-          if (!summary.wasPaused && (summary.completedCount > 0 || summary.failedCount > 0)) {
+          if (
+            !summary.wasPaused &&
+              (summary.completedCount > 0 || summary.awaitingApprovalCount > 0 || summary.failedCount > 0)
+          ) {
             NotificationHelper.postCompletionNotification(
               context = this@CompressionForegroundService,
               completedCount = summary.completedCount,
+              awaitingApprovalCount = summary.awaitingApprovalCount,
               failedCount = summary.failedCount,
               savedFormatted = FormatUtils.formatBytes(summary.savedBytes),
             )

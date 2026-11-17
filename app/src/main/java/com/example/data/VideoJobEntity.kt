@@ -5,6 +5,7 @@ import androidx.room.PrimaryKey
 import androidx.room.TypeConverter
 import com.example.model.CompressionPreset
 import com.example.model.JobStatus
+import com.example.model.OutputMode
 import com.example.model.TargetResolution
 import com.example.model.VideoCodec
 
@@ -26,6 +27,9 @@ data class VideoJobEntity(
   val targetResolution: TargetResolution,
   val targetCodec: VideoCodec,
   val customBitrateKbps: Int,
+  val outputMode: OutputMode = OutputMode.KEEP_ORIGINAL,
+  val stagedTempPath: String? = null,
+  val replacedOriginal: Boolean = false,
   val outputUri: String? = null,
   val outputFileName: String? = null,
   val outputSizeBytes: Long = 0L,
@@ -40,17 +44,31 @@ data class VideoJobEntity(
 class CompressXTypeConverters {
   @TypeConverter fun fromJobStatus(value: JobStatus): String = value.name
 
-  @TypeConverter fun toJobStatus(value: String): JobStatus = JobStatus.valueOf(value)
+  @TypeConverter
+  fun toJobStatus(value: String): JobStatus =
+    runCatching { JobStatus.valueOf(value) }.getOrDefault(JobStatus.QUEUED)
 
   @TypeConverter fun fromPreset(value: CompressionPreset): String = value.name
 
-  @TypeConverter fun toPreset(value: String): CompressionPreset = CompressionPreset.valueOf(value)
+  @TypeConverter
+  fun toPreset(value: String): CompressionPreset =
+    runCatching { CompressionPreset.valueOf(value) }.getOrDefault(CompressionPreset.BALANCED)
 
   @TypeConverter fun fromResolution(value: TargetResolution): String = value.name
 
-  @TypeConverter fun toResolution(value: String): TargetResolution = TargetResolution.valueOf(value)
+  @TypeConverter
+  fun toResolution(value: String): TargetResolution =
+    runCatching { TargetResolution.valueOf(value) }.getOrDefault(TargetResolution.FHD_1080P)
 
   @TypeConverter fun fromCodec(value: VideoCodec): String = value.name
 
-  @TypeConverter fun toCodec(value: String): VideoCodec = VideoCodec.valueOf(value)
+  @TypeConverter
+  fun toCodec(value: String): VideoCodec =
+    runCatching { VideoCodec.valueOf(value) }.getOrDefault(VideoCodec.H264)
+
+  @TypeConverter fun fromOutputMode(value: OutputMode): String = value.name
+
+  @TypeConverter
+  fun toOutputMode(value: String): OutputMode =
+    runCatching { OutputMode.valueOf(value) }.getOrDefault(OutputMode.KEEP_ORIGINAL)
 }

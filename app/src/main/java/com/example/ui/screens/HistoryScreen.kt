@@ -60,7 +60,12 @@ fun HistoryScreen(
             color = MaterialTheme.colorScheme.onSurface,
           )
           Text(
-            text = "${uiState.history.size} compressed videos • Tap play to verify output",
+            text =
+              if (uiState.stats.replacedCount > 0) {
+                "${uiState.history.size} completed (${uiState.stats.replacedCount} originals replaced) • Tap play to verify"
+              } else {
+                "${uiState.history.size} compressed videos • Tap play to verify output"
+              },
             style = MaterialTheme.typography.bodyMedium,
             color = TextSecondary,
           )

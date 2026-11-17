@@ -45,10 +45,22 @@ enum class VideoCodec(val label: String, val mimeType: String, val shortTag: Str
   H265("H.265 (HEVC)", "video/hevc", "HEVC"),
 }
 
+enum class OutputMode(val label: String, val subtitle: String) {
+  REPLACE_ORIGINAL(
+    label = "Replace Original (Recommended)",
+    subtitle = "Compresses & verifies first, asks your approval, then replaces original so only 1 file remains",
+  ),
+  KEEP_ORIGINAL(
+    label = "Keep Original",
+    subtitle = "Preserves original video and saves a separate compressed copy in your output folder",
+  ),
+}
+
 enum class JobStatus {
   QUEUED,
   PROCESSING,
   PAUSED,
+  AWAITING_APPROVAL,
   COMPLETED,
   FAILED,
   CANCELLED,
@@ -59,13 +71,18 @@ data class VideoCompressionConfig(
   val resolution: TargetResolution = TargetResolution.FHD_1080P,
   val codec: VideoCodec = VideoCodec.H264,
   val customBitrateKbps: Int = 3500,
+  val outputMode: OutputMode = OutputMode.KEEP_ORIGINAL,
+  val replaceOriginalConsentGranted: Boolean = false,
   val outputTreeUri: String? = null,
   val outputFolderName: String = "Movies/CompressX Studio",
   val thermalProtectionEnabled: Boolean = true,
   val pauseOnLowBattery: Boolean = true,
   val autoResumeAfterRestart: Boolean = true,
   val preferHardwareAcceleration: Boolean = true,
-)
+) {
+  val isReplaceOriginalActive: Boolean
+    get() = outputMode == OutputMode.REPLACE_ORIGINAL && replaceOriginalConsentGranted
+}
 
 data class DeviceCodecInfo(
   val codecName: String,
@@ -98,7 +115,9 @@ data class BatchSummaryStats(
   val queuedCount: Int = 0,
   val processingCount: Int = 0,
   val pausedCount: Int = 0,
+  val awaitingApprovalCount: Int = 0,
   val completedCount: Int = 0,
+  val replacedCount: Int = 0,
   val failedCount: Int = 0,
   val totalOriginalBytesCompleted: Long = 0L,
   val totalOutputBytesCompleted: Long = 0L,

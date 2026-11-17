@@ -56,7 +56,10 @@ fun VideoPreviewDialog(
   onDismiss: () -> Unit,
 ) {
   val context = LocalContext.current
-  val playbackUri = job.outputUri ?: job.sourceUri
+  val playbackUri =
+    job.outputUri
+      ?: job.stagedTempPath?.let { java.io.File(it).takeIf { f -> f.exists() }?.let { f -> Uri.fromFile(f).toString() } }
+      ?: job.sourceUri
   var playbackError by remember(playbackUri) { mutableStateOf<String?>(null) }
 
   val exoPlayer = remember(playbackUri) {

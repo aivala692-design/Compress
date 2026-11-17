@@ -106,6 +106,7 @@ class CompressXBatchQueueRobolectricTest {
 
       repo.markCompleted(
         id = "job_60",
+        replacedOriginal = false,
         outputUri = "content://media/external/video/compressed_60",
         outputFileName = "clip_60_compressed.mp4",
         outputSizeBytes = estimatedSmallerSize,

@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.model.CompressionPreset
+import com.example.model.OutputMode
 import com.example.model.TargetResolution
 import com.example.model.VideoCodec
 import com.example.model.VideoCompressionConfig
@@ -24,6 +25,8 @@ class PreferencesRepository(private val context: Context) {
     val RESOLUTION = stringPreferencesKey("resolution")
     val CODEC = stringPreferencesKey("codec")
     val CUSTOM_BITRATE_KBPS = intPreferencesKey("custom_bitrate_kbps")
+    val OUTPUT_MODE = stringPreferencesKey("output_mode")
+    val REPLACE_ORIGINAL_CONSENT = booleanPreferencesKey("replace_original_consent")
     val OUTPUT_TREE_URI = stringPreferencesKey("output_tree_uri")
     val OUTPUT_FOLDER_NAME = stringPreferencesKey("output_folder_name")
     val THERMAL_PROTECTION = booleanPreferencesKey("thermal_protection")
@@ -34,6 +37,18 @@ class PreferencesRepository(private val context: Context) {
 
   val configFlow: Flow<VideoCompressionConfig> =
     context.dataStore.data.map { prefs ->
+      val consentGranted = prefs[Keys.REPLACE_ORIGINAL_CONSENT] ?: false
+      val storedMode =
+        prefs[Keys.OUTPUT_MODE]?.let { runCatching { OutputMode.valueOf(it) }.getOrNull() }
+          ?: OutputMode.KEEP_ORIGINAL
+      // Never enable Replace Original without recorded explicit user consent
+      val effectiveMode =
+        if (storedMode == OutputMode.REPLACE_ORIGINAL && consentGranted) {
+          OutputMode.REPLACE_ORIGINAL
+        } else {
+          OutputMode.KEEP_ORIGINAL
+        }
+
       VideoCompressionConfig(
         preset =
           prefs[Keys.PRESET]?.let { runCatching { CompressionPreset.valueOf(it) }.getOrNull() }
@@ -45,6 +60,8 @@ class PreferencesRepository(private val context: Context) {
           prefs[Keys.CODEC]?.let { runCatching { VideoCodec.valueOf(it) }.getOrNull() }
             ?: VideoCodec.H264,
         customBitrateKbps = prefs[Keys.CUSTOM_BITRATE_KBPS] ?: 3500,
+        outputMode = effectiveMode,
+        replaceOriginalConsentGranted = consentGranted,
         outputTreeUri = prefs[Keys.OUTPUT_TREE_URI],
         outputFolderName = prefs[Keys.OUTPUT_FOLDER_NAME] ?: "Movies/CompressX Studio",
         thermalProtectionEnabled = prefs[Keys.THERMAL_PROTECTION] ?: true,
@@ -53,6 +70,21 @@ class PreferencesRepository(private val context: Context) {
         preferHardwareAcceleration = prefs[Keys.PREFER_HARDWARE] ?: true,
       )
     }
+
+  suspend fun updateOutputMode(mode: OutputMode, consentGranted: Boolean? = null) {
+    context.dataStore.edit { prefs ->
+      val hasConsent = consentGranted ?: (prefs[Keys.REPLACE_ORIGINAL_CONSENT] ?: false)
+      if (consentGranted != null) {
+        prefs[Keys.REPLACE_ORIGINAL_CONSENT] = consentGranted
+      }
+      prefs[Keys.OUTPUT_MODE] =
+        if (mode == OutputMode.REPLACE_ORIGINAL && hasConsent) {
+          OutputMode.REPLACE_ORIGINAL.name
+        } else {
+          OutputMode.KEEP_ORIGINAL.name
+        }
+    }
+  }
 
   suspend fun updatePreset(preset: CompressionPreset) {
     context.dataStore.edit { prefs ->

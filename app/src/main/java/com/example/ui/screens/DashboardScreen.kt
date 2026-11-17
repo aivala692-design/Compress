@@ -31,8 +31,10 @@ import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Thermostat
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -61,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.model.CompressionPreset
 import com.example.model.JobStatus
+import com.example.model.OutputMode
 import com.example.model.ThermalLevel
 import com.example.ui.QueueFilter
 import com.example.ui.StudioUiState
@@ -89,6 +92,9 @@ fun DashboardScreen(
   onPause: () -> Unit,
   onRetryFailed: () -> Unit,
   onSelectPreset: (CompressionPreset) -> Unit,
+  onSelectOutputMode: (OutputMode) -> Unit,
+  onOpenBatchReplace: () -> Unit,
+  onSaveAllCopies: () -> Unit,
   onNavigateToQueue: (QueueFilter) -> Unit,
   onNavigateToSettings: () -> Unit,
   modifier: Modifier = Modifier,
@@ -271,6 +277,68 @@ fun DashboardScreen(
         }
       }
 
+      // Verified Videos Awaiting User Approval to Replace Originals
+      if (uiState.stats.awaitingApprovalCount > 0) {
+        item {
+          Surface(
+            color = AmberWarning.copy(alpha = 0.14f),
+            shape = RoundedCornerShape(16.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, AmberWarning.copy(alpha = 0.5f)),
+            modifier = Modifier.fillMaxWidth().testTag("dashboard_awaiting_approval_banner"),
+          ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                  imageVector = Icons.Default.SwapHoriz,
+                  contentDescription = null,
+                  tint = AmberWarning,
+                  modifier = Modifier.size(20.dp),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                  text =
+                    "${uiState.stats.awaitingApprovalCount} Verified Video${if (uiState.stats.awaitingApprovalCount == 1) "" else "s"} Ready to Replace Originals",
+                  style = MaterialTheme.typography.titleSmall,
+                  color = AmberWarning,
+                )
+              }
+              Spacer(modifier = Modifier.height(4.dp))
+              Text(
+                text =
+                  "Compressed files passed playback verification. Approve to replace originals (keeping 1 file) or save separate copies.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+              )
+              Spacer(modifier = Modifier.height(10.dp))
+              Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                  onClick = onOpenBatchReplace,
+                  enabled = !uiState.isApplyingReplacements,
+                  colors =
+                    ButtonDefaults.buttonColors(
+                      containerColor = EmeraldSuccess,
+                      contentColor = Color(0xFF02171B),
+                    ),
+                  modifier = Modifier.weight(1f).height(48.dp).testTag("dashboard_approve_replace_btn"),
+                ) {
+                  Text(
+                    text = if (uiState.isApplyingReplacements) "Applying..." else "Approve & Replace",
+                    style = MaterialTheme.typography.labelLarge,
+                  )
+                }
+                OutlinedButton(
+                  onClick = onSaveAllCopies,
+                  enabled = !uiState.isApplyingReplacements,
+                  modifier = Modifier.height(48.dp).testTag("dashboard_save_copies_btn"),
+                ) {
+                  Text("Save Copies")
+                }
+              }
+            }
+          }
+        }
+      }
+
       // Queue Telemetry Counts
       item {
         Row(
@@ -285,15 +353,24 @@ fun DashboardScreen(
             onClick = { onNavigateToQueue(QueueFilter.QUEUED) },
           )
           StudioStatPill(
-            label = "ACTIVE",
-            count = uiState.stats.processingCount,
-            accent = CyanPrimary,
+            label = if (uiState.stats.awaitingApprovalCount > 0) "APPROVE" else "ACTIVE",
+            count =
+              if (uiState.stats.awaitingApprovalCount > 0) uiState.stats.awaitingApprovalCount
+              else uiState.stats.processingCount,
+            accent = if (uiState.stats.awaitingApprovalCount > 0) AmberWarning else CyanPrimary,
             modifier = Modifier.weight(1f),
-            onClick = { onNavigateToQueue(QueueFilter.PROCESSING) },
+            onClick = {
+              onNavigateToQueue(
+                if (uiState.stats.awaitingApprovalCount > 0) QueueFilter.AWAITING
+                else QueueFilter.PROCESSING
+              )
+            },
           )
           StudioStatPill(
-            label = "SAVED",
-            count = uiState.stats.completedCount,
+            label = if (uiState.stats.replacedCount > 0) "REPLACED" else "DONE",
+            count =
+              if (uiState.stats.replacedCount > 0) uiState.stats.replacedCount
+              else uiState.stats.completedCount,
             accent = EmeraldSuccess,
             modifier = Modifier.weight(1f),
             onClick = { onNavigateToQueue(QueueFilter.COMPLETED) },
@@ -435,8 +512,72 @@ fun DashboardScreen(
         }
       }
 
+      // Output Mode Switcher Strip (Replace Original vs Keep Original)
+      item {
+        val replaceActive = uiState.config.isReplaceOriginalActive
+        Surface(
+          modifier =
+            Modifier
+              .fillMaxWidth()
+              .clip(RoundedCornerShape(14.dp))
+              .clickable {
+                onSelectOutputMode(
+                  if (replaceActive) OutputMode.KEEP_ORIGINAL else OutputMode.REPLACE_ORIGINAL
+                )
+              }
+              .testTag("dashboard_output_mode_button"),
+          color = if (replaceActive) Color(0xFF0A3327) else StudioSurfaceElevated,
+          shape = RoundedCornerShape(14.dp),
+          border =
+            androidx.compose.foundation.BorderStroke(
+              1.dp,
+              if (replaceActive) EmeraldSuccess.copy(alpha = 0.65f) else StudioBorder,
+            ),
+        ) {
+          Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Icon(
+              imageVector = if (replaceActive) Icons.Default.SwapHoriz else Icons.Default.SaveAlt,
+              contentDescription = "Output storage mode",
+              tint = if (replaceActive) EmeraldSuccess else CyanPrimary,
+              modifier = Modifier.size(20.dp),
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text =
+                  if (replaceActive) "Output Mode: Replace Original (1 Final File)"
+                  else "Output Mode: Keep Original (2 Files)",
+                style = MaterialTheme.typography.labelLarge,
+                color = if (replaceActive) EmeraldSuccess else MaterialTheme.colorScheme.onSurface,
+              )
+              Text(
+                text =
+                  if (replaceActive) {
+                    "Verified first, asks your permission, then replaces original"
+                  } else {
+                    "Recommended: Tap to enable Replace Original Mode"
+                  },
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+              )
+            }
+            Text(
+              text = if (replaceActive) "Keep Copy" else "Enable",
+              style = MaterialTheme.typography.labelLarge,
+              color = if (replaceActive) TextSecondary else CyanPrimary,
+            )
+          }
+        }
+      }
+
       // Output Folder Selector Strip
       item {
+        val replaceActive = uiState.config.isReplaceOriginalActive
         Surface(
           modifier =
             Modifier
@@ -461,7 +602,9 @@ fun DashboardScreen(
             Spacer(modifier = Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
               Text(
-                text = "Output Folder (Auto _compressed suffix)",
+                text =
+                  if (replaceActive) "Copy Fallback Folder (if Save Copy is chosen)"
+                  else "Output Folder (Auto _compressed suffix)",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextMuted,
               )

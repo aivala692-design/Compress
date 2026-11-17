@@ -9,6 +9,7 @@ import com.example.engine.CompressionPlanCalculator
 import com.example.engine.DeviceGuardrailMonitor
 import com.example.engine.VideoCompressionEngine
 import com.example.model.JobStatus
+import com.example.model.OutputMode
 import com.example.ui.components.FormatUtils
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
@@ -19,6 +20,7 @@ import kotlinx.coroutines.launch
 
 data class BatchRunSummary(
   val completedCount: Int,
+  val awaitingApprovalCount: Int,
   val failedCount: Int,
   val savedBytes: Long,
   val wasPaused: Boolean,
@@ -57,6 +59,7 @@ class BatchQueueRunner(
     onStatusNote: (fileName: String, completed: Int, total: Int, note: String) -> Unit,
   ): BatchRunSummary {
     var sessionCompleted = 0
+    var sessionAwaitingApproval = 0
     var sessionFailed = 0
     var sessionSavedBytes = 0L
 
@@ -87,7 +90,7 @@ class BatchQueueRunner(
 
       val totalPending =
         runCatching { repo.countPendingOrActive().coerceAtLeast(1) }.getOrDefault(1)
-      val totalBatch = sessionCompleted + totalPending
+      val totalBatch = sessionCompleted + sessionAwaitingApproval + totalPending
 
       // Guardrail checks before encoding each video
       val estimatedNeededBytes =
@@ -112,7 +115,7 @@ class BatchQueueRunner(
         runCatching { repo.updateStatusAndProgress(nextJob.id, JobStatus.PAUSED, 0) }
         onStatusNote(
           nextJob.fileName,
-          sessionCompleted,
+          sessionCompleted + sessionAwaitingApproval,
           totalBatch,
           "Paused: low battery (${guardrail.batteryPercent}%)",
         )
@@ -122,7 +125,7 @@ class BatchQueueRunner(
       if (config.thermalProtectionEnabled && guardrail.isThrottled) {
         onStatusNote(
           nextJob.fileName,
-          sessionCompleted,
+          sessionCompleted + sessionAwaitingApproval,
           totalBatch,
           "Thermal cooldown active — waiting 15s...",
         )
@@ -133,7 +136,7 @@ class BatchQueueRunner(
       activeJobId = nextJob.id
       runCatching { repo.updateStatusAndProgress(nextJob.id, JobStatus.PROCESSING, 0) }
         .onFailure { CompressionLogger.e(TAG, "Failed updating PROCESSING status for ${nextJob.id}", it) }
-      onJobStarted(nextJob.fileName, sessionCompleted, totalBatch)
+      onJobStarted(nextJob.fileName, sessionCompleted + sessionAwaitingApproval, totalBatch)
 
       val plan =
         CompressionPlanCalculator.buildPlan(
@@ -147,6 +150,13 @@ class BatchQueueRunner(
           customBitrateKbps = nextJob.customBitrateKbps,
         )
 
+      val effectiveOutputMode =
+        if (config.isReplaceOriginalActive) {
+          OutputMode.REPLACE_ORIGINAL
+        } else {
+          OutputMode.KEEP_ORIGINAL
+        }
+
       try {
         var lastDbPct = -1
         var lastNotifPct = -1
@@ -157,6 +167,7 @@ class BatchQueueRunner(
             originalFileName = nextJob.fileName,
             plan = plan,
             preferHardware = config.preferHardwareAcceleration,
+            outputMode = effectiveOutputMode,
             customOutputTreeUri = config.outputTreeUri,
             onProgress = { pct ->
               val clamped = pct.coerceIn(0, 100)
@@ -171,21 +182,40 @@ class BatchQueueRunner(
               }
               if (clamped != lastNotifPct) {
                 lastNotifPct = clamped
-                onProgressChanged(nextJob.fileName, clamped, sessionCompleted, totalBatch)
+                onProgressChanged(
+                  nextJob.fileName,
+                  clamped,
+                  sessionCompleted + sessionAwaitingApproval,
+                  totalBatch,
+                )
               }
             },
           )
 
-        repo.markCompleted(
-          id = nextJob.id,
-          outputUri = result.outputUri.toString(),
-          outputFileName = result.outputFileName,
-          outputSizeBytes = result.outputSizeBytes,
-          usedHardwareEncoder = result.usedHardwareEncoder,
-          encoderName = result.encoderName,
-        )
-        sessionCompleted++
-        sessionSavedBytes += (nextJob.originalSizeBytes - result.outputSizeBytes).coerceAtLeast(0L)
+        val stagedPath = result.stagedTempPath
+        if (effectiveOutputMode == OutputMode.REPLACE_ORIGINAL && !stagedPath.isNullOrBlank()) {
+          // Never delete or overwrite the original automatically without user consent/system confirmation
+          repo.markAwaitingApproval(
+            id = nextJob.id,
+            stagedTempPath = stagedPath,
+            outputSizeBytes = result.outputSizeBytes,
+            usedHardwareEncoder = result.usedHardwareEncoder,
+            encoderName = result.encoderName,
+          )
+          sessionAwaitingApproval++
+        } else {
+          repo.markCompleted(
+            id = nextJob.id,
+            replacedOriginal = false,
+            outputUri = result.outputUri.toString(),
+            outputFileName = result.outputFileName,
+            outputSizeBytes = result.outputSizeBytes,
+            usedHardwareEncoder = result.usedHardwareEncoder,
+            encoderName = result.encoderName,
+          )
+          sessionCompleted++
+          sessionSavedBytes += (nextJob.originalSizeBytes - result.outputSizeBytes).coerceAtLeast(0L)
+        }
       } catch (_: CancellationException) {
         if (pauseRequested.get()) {
           runCatching { repo.updateStatusAndProgress(nextJob.id, JobStatus.PAUSED, 0) }
@@ -217,6 +247,7 @@ class BatchQueueRunner(
 
     return BatchRunSummary(
       completedCount = sessionCompleted,
+      awaitingApprovalCount = sessionAwaitingApproval,
       failedCount = sessionFailed,
       savedBytes = sessionSavedBytes,
       wasPaused = pauseRequested.get(),

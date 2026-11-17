@@ -134,6 +134,7 @@ object NotificationHelper {
   fun postCompletionNotification(
     context: Context,
     completedCount: Int,
+    awaitingApprovalCount: Int,
     failedCount: Int,
     savedFormatted: String,
   ) {
@@ -151,13 +152,19 @@ object NotificationHelper {
       )
 
     val title =
-      if (failedCount == 0) {
-        "Batch Complete • $completedCount compressed"
-      } else {
-        "Batch Finished • $completedCount done, $failedCount failed"
+      when {
+        awaitingApprovalCount > 0 ->
+          "Ready to Replace • $awaitingApprovalCount video${if (awaitingApprovalCount == 1) "" else "s"} verified"
+        failedCount == 0 -> "Batch Complete • $completedCount compressed"
+        else -> "Batch Finished • $completedCount done, $failedCount failed"
       }
 
-    val text = "Total storage reclaimed: $savedFormatted"
+    val text =
+      if (awaitingApprovalCount > 0) {
+        "Tap to confirm replacing original video${if (awaitingApprovalCount == 1) "" else "s"}."
+      } else {
+        "Total storage reclaimed: $savedFormatted"
+      }
 
     val notification =
       NotificationCompat.Builder(context, CHANNEL_COMPLETE)
