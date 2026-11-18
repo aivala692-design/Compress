@@ -13,8 +13,18 @@ import com.example.model.VideoCompressionConfig
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+
+data class EnqueueBatchResult(
+  val addedJobs: List<VideoJobEntity>,
+  val skippedDuplicateCount: Int,
+)
 
 class VideoQueueRepository(
   private val context: Context,
@@ -28,31 +38,70 @@ class VideoQueueRepository(
   suspend fun enqueueVideos(
     uris: List<Uri>,
     config: VideoCompressionConfig,
-  ): Int =
+  ): Int = enqueueVideosDetailed(uris, config).addedJobs.size
+
+  suspend fun enqueueVideosDetailed(
+    uris: List<Uri>,
+    config: VideoCompressionConfig,
+    deduplicateActive: Boolean = true,
+  ): EnqueueBatchResult =
     withContext(Dispatchers.IO) {
-      if (uris.isEmpty()) return@withContext 0
+      if (uris.isEmpty()) return@withContext EnqueueBatchResult(emptyList(), 0)
+
+      val activeUriSet =
+        if (deduplicateActive) dao.getActiveSourceUris().toHashSet() else hashSetOf()
+      val seenInBatch = hashSetOf<String>()
+      val uniqueUris = mutableListOf<Uri>()
+      var duplicateCount = 0
+
+      for (uri in uris) {
+        val uriKey = uri.toString()
+        if (!seenInBatch.add(uriKey) || (deduplicateActive && uriKey in activeUriSet)) {
+          duplicateCount++
+          continue
+        }
+        uniqueUris += uri
+      }
+
+      if (uniqueUris.isEmpty()) {
+        return@withContext EnqueueBatchResult(emptyList(), duplicateCount)
+      }
+
+      // Bounded parallel metadata probing via ContentResolver so 50+ shared videos load quickly
+      val semaphore = Semaphore(4)
+      val probedResults =
+        coroutineScope {
+          uniqueUris
+            .map { uri ->
+              async(Dispatchers.IO) {
+                semaphore.withPermit {
+                  // Persistable permission works for SAF documents and providers that offer persistable grants
+                  runCatching {
+                    context.contentResolver.takePersistableUriPermission(
+                      uri,
+                      Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                    )
+                  }.onFailure {
+                    runCatching {
+                      context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                      )
+                    }
+                  }
+                  uri to probeVideoMetadata(uri)
+                }
+              }
+            }
+            .awaitAll()
+        }
+
       var nextSort = dao.getMaxSortOrder() + 1
-      val jobs = mutableListOf<VideoJobEntity>()
       val effectiveMode =
         if (config.isReplaceOriginalActive) OutputMode.REPLACE_ORIGINAL else OutputMode.KEEP_ORIGINAL
 
-      for (uri in uris) {
-        // Persistable permission works for SAF documents and is ignored for one-time Photo Picker URIs
-        runCatching {
-          context.contentResolver.takePersistableUriPermission(
-            uri,
-            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-          )
-        }.onFailure {
-          runCatching {
-            context.contentResolver.takePersistableUriPermission(
-              uri,
-              Intent.FLAG_GRANT_READ_URI_PERMISSION,
-            )
-          }
-        }
-        val probed = probeVideoMetadata(uri)
-        jobs +=
+      val jobs =
+        probedResults.map { (uri, probed) ->
           VideoJobEntity(
             id = UUID.randomUUID().toString(),
             sourceUri = uri.toString(),
@@ -73,10 +122,30 @@ class VideoQueueRepository(
             outputMode = effectiveMode,
             errorMessage = probed.errorMessage,
           )
-      }
+        }
 
       jobs.chunked(50).forEach { chunk -> dao.insertJobs(chunk) }
-      jobs.size
+      EnqueueBatchResult(addedJobs = jobs, skippedDuplicateCount = duplicateCount)
+    }
+
+  suspend fun applyConfigToQueuedJobs(
+    jobIds: List<String>,
+    config: VideoCompressionConfig,
+  ) =
+    withContext(Dispatchers.IO) {
+      if (jobIds.isEmpty()) return@withContext
+      val effectiveMode =
+        if (config.isReplaceOriginalActive) OutputMode.REPLACE_ORIGINAL else OutputMode.KEEP_ORIGINAL
+      jobIds.chunked(200).forEach { chunk ->
+        dao.updateQueuedJobsConfig(
+          ids = chunk,
+          preset = config.preset,
+          targetResolution = config.resolution,
+          targetCodec = config.codec,
+          customBitrateKbps = config.customBitrateKbps,
+          outputMode = effectiveMode,
+        )
+      }
     }
 
   suspend fun getNextQueuedJob(): VideoJobEntity? = dao.getNextQueuedJob()
@@ -253,7 +322,11 @@ class VideoQueueRepository(
   )
 
   private fun probeVideoMetadata(uri: Uri): ProbedVideoInfo {
-    var displayName = "video_${System.currentTimeMillis()}.mp4"
+    var displayName =
+      uri.lastPathSegment
+        ?.substringAfterLast('/')
+        ?.takeIf { it.isNotBlank() && it.contains('.') }
+        ?: "shared_video_${System.currentTimeMillis()}.mp4"
     var fileSize = 0L
 
     runCatching {
@@ -264,7 +337,7 @@ class VideoQueueRepository(
             val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
             val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
             if (nameIdx >= 0 && !cursor.isNull(nameIdx)) {
-              displayName = cursor.getString(nameIdx)
+              cursor.getString(nameIdx)?.takeIf { it.isNotBlank() }?.let { displayName = it }
             }
             if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
               fileSize = cursor.getLong(sizeIdx)
@@ -276,7 +349,26 @@ class VideoQueueRepository(
     if (fileSize <= 0L) {
       fileSize =
         runCatching {
-          context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0L
+          context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+            val declared = afd.length
+            if (declared > 0L) declared else afd.parcelFileDescriptor.statSize.coerceAtLeast(0L)
+          } ?: 0L
+        }.getOrDefault(0L)
+    }
+
+    if (fileSize <= 0L) {
+      fileSize =
+        runCatching {
+          context.contentResolver.openInputStream(uri)?.use { stream ->
+            var count = 0L
+            val buf = ByteArray(16 * 1024)
+            while (true) {
+              val read = stream.read(buf)
+              if (read <= 0) break
+              count += read
+            }
+            count
+          } ?: 0L
         }.getOrDefault(0L)
     }
 
@@ -295,6 +387,14 @@ class VideoQueueRepository(
           ?: 0
       val bitrate =
         retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
+      if (displayName.startsWith("shared_video_")) {
+        retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
+          ?.trim()
+          ?.takeIf { it.isNotEmpty() }
+          ?.let { title ->
+            displayName = if (title.contains('.')) title else "$title.mp4"
+          }
+      }
 
       if (hasVideo != "yes" || width <= 0 || height <= 0) {
         ProbedVideoInfo(

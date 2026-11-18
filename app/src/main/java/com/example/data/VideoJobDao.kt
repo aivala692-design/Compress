@@ -24,6 +24,12 @@ interface VideoJobDao {
   @Query("SELECT * FROM video_jobs WHERE id = :id LIMIT 1")
   suspend fun getJobById(id: String): VideoJobEntity?
 
+  @Query("SELECT * FROM video_jobs WHERE id IN (:ids) ORDER BY sortOrder ASC, createdAt ASC")
+  suspend fun getJobsByIds(ids: List<String>): List<VideoJobEntity>
+
+  @Query("SELECT sourceUri FROM video_jobs WHERE status IN ('QUEUED', 'PROCESSING', 'PAUSED', 'AWAITING_APPROVAL')")
+  suspend fun getActiveSourceUris(): List<String>
+
   @Query("SELECT * FROM video_jobs WHERE status = 'QUEUED' ORDER BY sortOrder ASC, createdAt ASC LIMIT 1")
   suspend fun getNextQueuedJob(): VideoJobEntity?
 
@@ -37,6 +43,26 @@ interface VideoJobDao {
   suspend fun insertJobs(jobs: List<VideoJobEntity>)
 
   @Update suspend fun updateJob(job: VideoJobEntity)
+
+  @Query(
+    """
+    UPDATE video_jobs
+    SET preset = :preset,
+        targetResolution = :targetResolution,
+        targetCodec = :targetCodec,
+        customBitrateKbps = :customBitrateKbps,
+        outputMode = :outputMode
+    WHERE id IN (:ids) AND status = 'QUEUED'
+    """
+  )
+  suspend fun updateQueuedJobsConfig(
+    ids: List<String>,
+    preset: com.example.model.CompressionPreset,
+    targetResolution: com.example.model.TargetResolution,
+    targetCodec: com.example.model.VideoCodec,
+    customBitrateKbps: Int,
+    outputMode: com.example.model.OutputMode,
+  )
 
   @Query("UPDATE video_jobs SET sortOrder = :sortOrder WHERE id = :id")
   suspend fun updateSortOrder(id: String, sortOrder: Int)

@@ -73,6 +73,7 @@ import androidx.navigation.compose.rememberNavController
 import com.example.R
 import com.example.data.VideoJobEntity
 import com.example.ui.components.FormatUtils
+import com.example.ui.components.ShareReviewDialog
 import com.example.ui.components.VideoPreviewDialog
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.HistoryScreen
@@ -296,6 +297,12 @@ fun CompressXApp(
     }
   }
 
+  LaunchedEffect(uiState.shareReviewState?.jobIds) {
+    if (uiState.shareReviewState != null) {
+      navigateTopLevel(QueueRoute)
+    }
+  }
+
   Scaffold(
     containerColor = StudioVoid,
     contentWindowInsets = WindowInsets(0, 0, 0, 0),
@@ -437,6 +444,29 @@ fun CompressXApp(
         }
       }
     }
+  }
+
+  // Share Sheet Review Confirmation Dialog (stacked under Replace Consent dialog if needed)
+  val activeShareReview = uiState.shareReviewState
+  if (activeShareReview != null && uiState.sharedReviewJobs.isNotEmpty()) {
+    ShareReviewDialog(
+      reviewState = activeShareReview,
+      sharedJobs = uiState.sharedReviewJobs,
+      config = uiState.config,
+      onSelectPreset = { viewModel.selectPreset(it) },
+      onSelectResolution = { viewModel.selectResolution(it) },
+      onChangeBitrateKbps = { viewModel.updateCustomBitrateKbps(it) },
+      onSelectOutputMode = { viewModel.onSelectOutputMode(it) },
+      onReviewInQueue = {
+        viewModel.dismissShareReview()
+        navigateTopLevel(QueueRoute)
+      },
+      onConfirmStart = {
+        viewModel.confirmShareReviewAndPrepareStart {
+          startBatchWithNotificationCheck()
+        }
+      },
+    )
   }
 
   // First-time Replace Original Mode explanation & explicit user consent dialog

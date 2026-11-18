@@ -34,6 +34,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+import com.example.engine.ParsedSharePayload
+
 enum class QueueFilter(val label: String) {
   ALL("All"),
   QUEUED("Queued"),
@@ -48,6 +50,12 @@ data class PendingSystemApprovalRequest(
   val approvedJobIds: Set<String>,
 )
 
+data class IncomingShareReviewState(
+  val jobIds: List<String>,
+  val captionText: String? = null,
+  val skippedDuplicateCount: Int = 0,
+)
+
 data class StudioUiState(
   val jobs: List<VideoJobEntity> = emptyList(),
   val history: List<VideoJobEntity> = emptyList(),
@@ -60,6 +68,7 @@ data class StudioUiState(
   val isApplyingReplacements: Boolean = false,
   val showReplaceConsentDialog: Boolean = false,
   val showBatchReplaceDialog: Boolean = false,
+  val shareReviewState: IncomingShareReviewState? = null,
   val pendingSystemApproval: PendingSystemApprovalRequest? = null,
   val statusBannerMessage: String? = null,
 ) {
@@ -71,6 +80,13 @@ data class StudioUiState(
 
   val awaitingApprovalJobs: List<VideoJobEntity>
     get() = jobs.filter { it.status == JobStatus.AWAITING_APPROVAL }
+
+  val sharedReviewJobs: List<VideoJobEntity>
+    get() {
+      val ids = shareReviewState?.jobIds ?: return emptyList()
+      val byId = jobs.associateBy { it.id }
+      return ids.mapNotNull { byId[it] }
+    }
 }
 
 class CompressXViewModel(application: Application) : AndroidViewModel(application) {
@@ -86,6 +102,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
   private val isApplyingReplacements = MutableStateFlow(false)
   private val showReplaceConsentDialog = MutableStateFlow(false)
   private val showBatchReplaceDialog = MutableStateFlow(false)
+  private val shareReviewState = MutableStateFlow<IncomingShareReviewState?>(null)
   private val pendingSystemApproval = MutableStateFlow<PendingSystemApprovalRequest?>(null)
   private val bannerMessage = MutableStateFlow<String?>(null)
   private val guardrailsFlow = MutableStateFlow(guardrailsMonitor.sample())
@@ -102,6 +119,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       isApplyingReplacements,
       showReplaceConsentDialog,
       showBatchReplaceDialog,
+      shareReviewState,
       pendingSystemApproval,
       bannerMessage,
       guardrailsFlow,
@@ -116,9 +134,10 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       val replacing = values[5] as Boolean
       val showConsent = values[6] as Boolean
       val showBatchConfirm = values[7] as Boolean
-      val sysApproval = values[8] as PendingSystemApprovalRequest?
-      val banner = values[9] as String?
-      val guardrails = values[10] as GuardrailState
+      val shareReview = values[8] as IncomingShareReviewState?
+      val sysApproval = values[9] as PendingSystemApprovalRequest?
+      val banner = values[10] as String?
+      val guardrails = values[11] as GuardrailState
 
       val stats = queueRepo.computeStats(jobs)
       if (prevProcessingCount > 0 && stats.processingCount == 0 && stats.awaitingApprovalCount > 0) {
@@ -138,6 +157,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
         isApplyingReplacements = replacing,
         showReplaceConsentDialog = showConsent,
         showBatchReplaceDialog = showBatchConfirm,
+        shareReviewState = shareReview,
         pendingSystemApproval = sysApproval,
         statusBannerMessage = banner,
       )
@@ -191,12 +211,14 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
         val current = prefsRepo.configFlow.first()
         if (current.replaceOriginalConsentGranted) {
           prefsRepo.updateOutputMode(OutputMode.REPLACE_ORIGINAL)
+          syncShareReviewJobsWithLatestConfig()
           bannerMessage.value = "Replace Original Mode active — originals replaced after verification & approval."
         } else {
           showReplaceConsentDialog.value = true
         }
       } else {
         prefsRepo.updateOutputMode(OutputMode.KEEP_ORIGINAL)
+        syncShareReviewJobsWithLatestConfig()
         bannerMessage.value = "Keep Original Mode active — compressed copies saved separately."
       }
     }
@@ -206,6 +228,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
     viewModelScope.launch {
       prefsRepo.updateOutputMode(OutputMode.REPLACE_ORIGINAL, consentGranted = true)
       showReplaceConsentDialog.value = false
+      syncShareReviewJobsWithLatestConfig()
       bannerMessage.value = "Replace Original Mode enabled. Originals are only replaced after verification & approval."
     }
   }
@@ -420,14 +443,105 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
     }
   }
 
+  fun onSharedPayloadReceived(payload: ParsedSharePayload) {
+    viewModelScope.launch {
+      if (payload.isEmpty) {
+        bannerMessage.value =
+          if (!payload.captionText.isNullOrBlank()) {
+            "No readable video URIs found in shared content."
+          } else {
+            "Unable to open shared video content."
+          }
+        return@launch
+      }
+
+      isImporting.value = true
+      try {
+        val currentConfig = prefsRepo.configFlow.first()
+        val result =
+          queueRepo.enqueueVideosDetailed(
+            uris = payload.uris,
+            config = currentConfig,
+            deduplicateActive = true,
+          )
+        val addedCount = result.addedJobs.size
+        val skippedCount = result.skippedDuplicateCount
+
+        if (addedCount > 0) {
+          selectedFilter.value = QueueFilter.ALL
+          val existingReview = shareReviewState.value
+          val mergedIds =
+            ((existingReview?.jobIds ?: emptyList()) + result.addedJobs.map { it.id }).distinct()
+          shareReviewState.value =
+            IncomingShareReviewState(
+              jobIds = mergedIds,
+              captionText = payload.captionText ?: existingReview?.captionText,
+              skippedDuplicateCount = (existingReview?.skippedDuplicateCount ?: 0) + skippedCount,
+            )
+          bannerMessage.value =
+            buildString {
+              append("Received $addedCount shared video${if (addedCount == 1) "" else "s"}")
+              if (skippedCount > 0) {
+                append(" ($skippedCount duplicate${if (skippedCount == 1) "" else "s"} skipped)")
+              }
+            }
+        } else if (skippedCount > 0) {
+          selectedFilter.value = QueueFilter.QUEUED
+          bannerMessage.value =
+            "Shared video${if (skippedCount == 1) " is" else "s are"} already in the compression queue"
+        }
+      } catch (t: Throwable) {
+        CompressionLogger.e("CompressXVM", "Failed receiving shared videos", t)
+        bannerMessage.value = "Failed receiving shared videos: ${CompressionLogger.formatUserErrorMessage(t)}"
+      } finally {
+        isImporting.value = false
+      }
+    }
+  }
+
+  fun dismissShareReview() {
+    shareReviewState.value = null
+  }
+
+  fun confirmShareReviewAndPrepareStart(onReadyToStart: () -> Unit) {
+    viewModelScope.launch {
+      syncShareReviewJobsWithLatestConfig()
+      shareReviewState.value = null
+      onReadyToStart()
+    }
+  }
+
+  private suspend fun syncShareReviewJobsWithLatestConfig() {
+    val activeShare = shareReviewState.value ?: return
+    if (activeShare.jobIds.isEmpty()) return
+    val updatedConfig = prefsRepo.configFlow.first()
+    queueRepo.applyConfigToQueuedJobs(activeShare.jobIds, updatedConfig)
+  }
+
   fun onVideosSelected(uris: List<Uri>) {
     if (uris.isEmpty()) return
     viewModelScope.launch {
       isImporting.value = true
       try {
         val currentConfig = prefsRepo.configFlow.first()
-        val addedCount = queueRepo.enqueueVideos(uris, currentConfig)
-        bannerMessage.value = "Added $addedCount video${if (addedCount == 1) "" else "s"} to batch queue"
+        val result =
+          queueRepo.enqueueVideosDetailed(
+            uris = uris,
+            config = currentConfig,
+            deduplicateActive = true,
+          )
+        val addedCount = result.addedJobs.size
+        val skipped = result.skippedDuplicateCount
+        bannerMessage.value =
+          when {
+            addedCount > 0 && skipped > 0 ->
+              "Added $addedCount video${if (addedCount == 1) "" else "s"} ($skipped duplicate${if (skipped == 1) "" else "s"} skipped)"
+            addedCount > 0 ->
+              "Added $addedCount video${if (addedCount == 1) "" else "s"} to batch queue"
+            skipped > 0 ->
+              "Selected video${if (skipped == 1) " is" else "s are"} already in the queue"
+            else -> null
+          }
       } catch (t: Throwable) {
         CompressionLogger.e("CompressXVM", "Failed to import selected videos", t)
         bannerMessage.value = "Failed to import selected videos: ${CompressionLogger.formatUserErrorMessage(t)}"
@@ -550,7 +664,10 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
   }
 
   fun selectPreset(preset: CompressionPreset) {
-    viewModelScope.launch { prefsRepo.updatePreset(preset) }
+    viewModelScope.launch {
+      prefsRepo.updatePreset(preset)
+      syncShareReviewJobsWithLatestConfig()
+    }
   }
 
   fun selectResolution(resolution: TargetResolution) {
@@ -559,11 +676,15 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       if (uiState.value.config.preset != CompressionPreset.CUSTOM) {
         prefsRepo.updatePreset(CompressionPreset.CUSTOM)
       }
+      syncShareReviewJobsWithLatestConfig()
     }
   }
 
   fun selectCodec(codec: VideoCodec) {
-    viewModelScope.launch { prefsRepo.updateCodec(codec) }
+    viewModelScope.launch {
+      prefsRepo.updateCodec(codec)
+      syncShareReviewJobsWithLatestConfig()
+    }
   }
 
   fun updateCustomBitrateKbps(kbps: Int) {
@@ -572,6 +693,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       if (uiState.value.config.preset != CompressionPreset.CUSTOM) {
         prefsRepo.updatePreset(CompressionPreset.CUSTOM)
       }
+      syncShareReviewJobsWithLatestConfig()
     }
   }
 
