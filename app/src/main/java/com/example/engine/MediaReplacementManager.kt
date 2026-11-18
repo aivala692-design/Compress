@@ -14,6 +14,7 @@ import android.provider.DocumentsContract
 import android.provider.MediaStore
 import androidx.documentfile.provider.DocumentFile
 import com.example.data.VideoJobEntity
+import com.example.model.ReplacementPermissionStatus
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -24,8 +25,32 @@ sealed class ResolvedReplaceTarget {
 
   data class SafDocumentTarget(val documentUri: Uri) : ResolvedReplaceTarget()
 
-  data class UnsupportedTarget(val reason: String) : ResolvedReplaceTarget()
+  data class UnsupportedTarget(val reason: String, val authority: String = "") : ResolvedReplaceTarget()
 }
+
+data class MediaStoreMeta(
+  val displayName: String? = null,
+  val relativePath: String? = null,
+  val dateTakenMs: Long? = null,
+  val dataPath: String? = null,
+)
+
+data class EligibilityAssessment(
+  val status: ReplacementPermissionStatus,
+  val authority: String,
+  val resolvedTarget: ResolvedReplaceTarget,
+  val readOnlyReason: String? = null,
+  val mediaStoreMeta: MediaStoreMeta? = null,
+)
+
+data class BatchDeletePreparation(
+  val deleteRequestIntentSender: IntentSender?,
+  val deleteApprovedJobIds: Set<String>,
+  val snapshots: Map<String, MediaStoreMeta>,
+  val directSafJobs: List<VideoJobEntity>,
+  val legacyMediaStoreJobs: List<VideoJobEntity>,
+  val readOnlyOrFailedJobs: List<Pair<VideoJobEntity, String>>,
+)
 
 data class BatchApprovalPreparation(
   val mediaStoreIntentSender: IntentSender?,
@@ -57,11 +82,76 @@ class MediaReplacementManager(
   companion object {
     private const val TAG = "CompressXReplace"
     private const val STREAM_BUFFER_SIZE = 64 * 1024
+
+    private val KNOWN_READ_ONLY_PROVIDERS =
+      mapOf(
+        "com.google.android.apps.nbu.files.provider" to
+          "Files by Google shared URI (read-only provider). Android does not permit deleting or overwriting this source — use Save Compressed Copy.",
+        "com.whatsapp.provider.media" to
+          "WhatsApp shared media URI (read-only provider). Use Save Compressed Copy; original stays untouched.",
+        "org.telegram.messenger.provider" to
+          "Telegram shared media URI (read-only provider). Use Save Compressed Copy; original stays untouched.",
+        "com.google.android.apps.docs.storage" to
+          "Cloud document provider (read-only source). Use Save Compressed Copy.",
+      )
+  }
+
+  fun isKnownReadOnlyAuthority(authority: String): Boolean {
+    if (authority.isBlank()) return false
+    if (KNOWN_READ_ONLY_PROVIDERS.containsKey(authority)) return true
+    if (
+      authority.endsWith(".fileprovider") ||
+        authority.contains(".provider.media") ||
+        authority.contains("nbu.files")
+    ) {
+      return authority != MediaStore.AUTHORITY
+    }
+    return false
+  }
+
+  fun assessEligibility(sourceUri: Uri): EligibilityAssessment {
+    val authority = sourceUri.authority.orEmpty()
+    val resolved = resolveTargetUri(sourceUri)
+    return when (resolved) {
+      is ResolvedReplaceTarget.MediaStoreTarget -> {
+        val meta = queryMediaStoreMetadata(resolved.mediaUri)
+        EligibilityAssessment(
+          status = ReplacementPermissionStatus.ELIGIBLE,
+          authority = authority,
+          resolvedTarget = resolved,
+          readOnlyReason = null,
+          mediaStoreMeta = meta,
+        )
+      }
+      is ResolvedReplaceTarget.SafDocumentTarget -> {
+        EligibilityAssessment(
+          status = ReplacementPermissionStatus.ELIGIBLE,
+          authority = authority,
+          resolvedTarget = resolved,
+          readOnlyReason = null,
+          mediaStoreMeta = null,
+        )
+      }
+      is ResolvedReplaceTarget.UnsupportedTarget -> {
+        EligibilityAssessment(
+          status = ReplacementPermissionStatus.READ_ONLY,
+          authority = authority,
+          resolvedTarget = resolved,
+          readOnlyReason = resolved.reason,
+          mediaStoreMeta = null,
+        )
+      }
+    }
   }
 
   fun resolveTargetUri(sourceUri: Uri): ResolvedReplaceTarget {
     val authority = sourceUri.authority.orEmpty()
     val segments = sourceUri.pathSegments
+
+    // Explicit read-only providers (e.g., Files by Google nbu.files.provider) must never trigger doomed delete prompts
+    KNOWN_READ_ONLY_PROVIDERS[authority]?.let { reason ->
+      return ResolvedReplaceTarget.UnsupportedTarget(reason = reason, authority = authority)
+    }
 
     // 1. Canonical MediaStore video URI (content://media/external.../video/media/<id>)
     if (authority == MediaStore.AUTHORITY && !segments.contains("picker") && !segments.contains("picker_get_content")) {
@@ -78,7 +168,9 @@ class MediaReplacementManager(
         return ResolvedReplaceTarget.MediaStoreTarget(mediaUri = candidate, originalUri = sourceUri)
       }
       return ResolvedReplaceTarget.UnsupportedTarget(
-        "Photo Picker returned a cloud/virtual URI that cannot replace the original file in-place. Use 'Browse Device Folders (SAF)' to replace originals, or tap 'Save Copy'.",
+        reason =
+          "Photo Picker returned a cloud/virtual URI that cannot replace the original file in-place. Use 'Browse Device Folders (SAF)' to replace originals, or tap 'Save Compressed Copy'.",
+        authority = authority,
       )
     }
 
@@ -91,14 +183,218 @@ class MediaReplacementManager(
     }
 
     // 4. Direct SAF Document URI with write support (e.g., externalstorage.documents / SD card / OTG)
-    val doc = runCatching { DocumentFile.fromSingleUri(context, sourceUri) }.getOrNull()
-    if (doc != null && doc.canWrite()) {
-      return ResolvedReplaceTarget.SafDocumentTarget(sourceUri)
+    if (!isKnownReadOnlyAuthority(authority)) {
+      val doc = runCatching { DocumentFile.fromSingleUri(context, sourceUri) }.getOrNull()
+      if (doc != null && doc.canWrite()) {
+        return ResolvedReplaceTarget.SafDocumentTarget(sourceUri)
+      }
     }
 
-    return ResolvedReplaceTarget.UnsupportedTarget(
-      "Source provider ($authority) is read-only and does not permit replacing the original video.",
+    val friendlyReason =
+      if (authority.isNotBlank()) {
+        "Read-only source provider ($authority) does not support batch replacement or deletion. Use Save Compressed Copy; original stays untouched."
+      } else {
+        "Source URI is read-only and does not permit replacing the original video."
+      }
+    return ResolvedReplaceTarget.UnsupportedTarget(reason = friendlyReason, authority = authority)
+  }
+
+  /**
+   * Centralized batch permission prep using MediaStore.createDeleteRequest() on Android 11+ (API 30+).
+   * Never prompts individually per MediaStore file when batch deletion approval is supported,
+   * and immediately filters out read-only providers (e.g. com.google.android.apps.nbu.files.provider).
+   */
+  fun prepareBatchDeleteApproval(jobs: List<VideoJobEntity>): BatchDeletePreparation {
+    val mediaStoreCandidates = mutableListOf<Pair<VideoJobEntity, Uri>>()
+    val snapshots = mutableMapOf<String, MediaStoreMeta>()
+    val directSafJobs = mutableListOf<VideoJobEntity>()
+    val legacyMediaStoreJobs = mutableListOf<VideoJobEntity>()
+    val readOnlyOrFailed = mutableListOf<Pair<VideoJobEntity, String>>()
+
+    for (job in jobs) {
+      val stagedFile = job.stagedTempPath?.let(::File)
+      if (stagedFile == null || !verifyStagedPlayable(stagedFile)) {
+        readOnlyOrFailed +=
+          job to "Compressed staged video missing or failed playback verification; original preserved."
+        continue
+      }
+
+      when (val resolved = resolveTargetUri(Uri.parse(job.sourceUri))) {
+        is ResolvedReplaceTarget.UnsupportedTarget -> {
+          readOnlyOrFailed += job to resolved.reason
+        }
+        is ResolvedReplaceTarget.SafDocumentTarget -> {
+          directSafJobs += job
+        }
+        is ResolvedReplaceTarget.MediaStoreTarget -> {
+          val liveMeta = queryMediaStoreMetadata(resolved.mediaUri)
+          val snapshot =
+            MediaStoreMeta(
+              displayName = liveMeta.displayName ?: job.fileName,
+              relativePath = liveMeta.relativePath ?: job.sourceRelativePath,
+              dateTakenMs = liveMeta.dateTakenMs ?: job.sourceDateTakenMs,
+              dataPath = liveMeta.dataPath,
+            )
+          snapshots[job.id] = snapshot
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            mediaStoreCandidates += job to resolved.mediaUri
+          } else {
+            legacyMediaStoreJobs += job
+          }
+        }
+      }
+    }
+
+    if (mediaStoreCandidates.isEmpty() || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+      return BatchDeletePreparation(
+        deleteRequestIntentSender = null,
+        deleteApprovedJobIds = emptySet(),
+        snapshots = snapshots,
+        directSafJobs = directSafJobs,
+        legacyMediaStoreJobs = legacyMediaStoreJobs,
+        readOnlyOrFailedJobs = readOnlyOrFailed,
+      )
+    }
+
+    val resolver = context.contentResolver
+    val validPairs = mutableListOf<Pair<VideoJobEntity, Uri>>()
+    val allUris = mediaStoreCandidates.map { it.second }
+    val deletePendingIntent =
+      try {
+        validPairs.addAll(mediaStoreCandidates)
+        MediaStore.createDeleteRequest(resolver, allUris)
+      } catch (batchErr: Throwable) {
+        CompressionLogger.w(
+          TAG,
+          "Batch createDeleteRequest failed (${batchErr.message}); isolating invalid URIs",
+          batchErr,
+        )
+        validPairs.clear()
+        for ((job, candidateUri) in mediaStoreCandidates) {
+          val ok =
+            runCatching { MediaStore.createDeleteRequest(resolver, listOf(candidateUri)) }.isSuccess
+          if (ok) {
+            validPairs += job to candidateUri
+          } else {
+            readOnlyOrFailed +=
+              job to
+                "Source URI (${job.sourceAuthority ?: "provider"}) rejected batch deletion. Tap Save Compressed Copy."
+          }
+        }
+        if (validPairs.isNotEmpty()) {
+          runCatching {
+            MediaStore.createDeleteRequest(resolver, validPairs.map { it.second })
+          }.getOrNull()
+        } else {
+          null
+        }
+      }
+
+    return BatchDeletePreparation(
+      deleteRequestIntentSender = deletePendingIntent?.intentSender,
+      deleteApprovedJobIds = validPairs.map { it.first.id }.toSet(),
+      snapshots = snapshots,
+      directSafJobs = directSafJobs,
+      legacyMediaStoreJobs = legacyMediaStoreJobs,
+      readOnlyOrFailedJobs = readOnlyOrFailed,
     )
+  }
+
+  /**
+   * Called strictly AFTER MediaStore.createDeleteRequest() returns RESULT_OK (which deleted the original MediaStore rows)
+   * OR for verified staged outputs whose originals were deleted by the system batch dialog.
+   * Preserves original filename, folder (RELATIVE_PATH), and DATE_TAKEN.
+   */
+  fun publishBatchApprovedOutput(
+    job: VideoJobEntity,
+    snapshot: MediaStoreMeta?,
+  ): ReplacementOutcome {
+    val stagedPath = job.stagedTempPath
+      ?: return ReplacementOutcome.Failed("Missing staged compressed file path for ${job.fileName}")
+    val stagedFile = File(stagedPath)
+    if (!verifyStagedPlayable(stagedFile)) {
+      return ReplacementOutcome.Failed(
+        "Staged compressed video failed verification; cannot publish ${job.fileName}.",
+      )
+    }
+
+    val resolver = context.contentResolver
+    val originalName = snapshot?.displayName ?: job.fileName
+    val finalDisplayName = ensureMp4ExtensionKeepingBase(originalName)
+    val targetRelativePath =
+      snapshot?.relativePath ?: job.sourceRelativePath ?: "${Environment.DIRECTORY_MOVIES}/CompressX Studio"
+    val dateTaken = snapshot?.dateTakenMs ?: job.sourceDateTakenMs
+    val stagedLength = stagedFile.length()
+
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+      return executeSingleReplacement(job)
+    }
+
+    val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    val base = finalDisplayName.substringBeforeLast('.', finalDisplayName)
+    val candidateNames =
+      listOf(finalDisplayName, "${base}_(1).mp4", "${base}_(2).mp4")
+
+    var pendingUri: Uri? = null
+    var publishedName = finalDisplayName
+    for (candidate in candidateNames) {
+      val insertValues =
+        ContentValues().apply {
+          put(MediaStore.Video.Media.DISPLAY_NAME, candidate)
+          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+          put(MediaStore.Video.Media.RELATIVE_PATH, targetRelativePath)
+          put(MediaStore.Video.Media.IS_PENDING, 1)
+          if (dateTaken != null && dateTaken > 0L) {
+            put(MediaStore.Video.Media.DATE_TAKEN, dateTaken)
+          }
+        }
+      val inserted =
+        try {
+          resolver.insert(collection, insertValues)
+        } catch (t: Throwable) {
+          CompressionLogger.w(TAG, "Insert attempt failed for $candidate (${t.message})")
+          null
+        }
+      if (inserted != null) {
+        pendingUri = inserted
+        publishedName = candidate
+        break
+      }
+    }
+
+    if (pendingUri == null) {
+      return ReplacementOutcome.Failed(
+        "Could not publish $finalDisplayName to MediaStore; staged copy preserved.",
+      )
+    }
+
+    return try {
+      resolver.openOutputStream(pendingUri)?.use { out ->
+        FileInputStream(stagedFile).use { input -> input.copyTo(out, STREAM_BUFFER_SIZE) }
+        out.flush()
+      } ?: throw IOException("Unable to open MediaStore stream for $publishedName")
+
+      val publishValues =
+        ContentValues().apply {
+          put(MediaStore.Video.Media.IS_PENDING, 0)
+          put(MediaStore.Video.Media.SIZE, stagedLength)
+        }
+      resolver.update(pendingUri, publishValues, null, null)
+      verifyReplacedUriPlayable(pendingUri)
+      runCatching { stagedFile.delete() }
+      CompressionLogger.i(TAG, "Batch-published verified output keeping filename '$publishedName': $pendingUri")
+      ReplacementOutcome.Replaced(
+        outputUri = pendingUri,
+        outputFileName = publishedName,
+        outputSizeBytes = stagedLength,
+      )
+    } catch (t: Throwable) {
+      CompressionLogger.e(TAG, "Batch publish failed for $publishedName", t)
+      runCatching { resolver.delete(pendingUri, null, null) }
+      ReplacementOutcome.Failed(
+        "Failed publishing $publishedName: ${CompressionLogger.formatUserErrorMessage(t)}",
+      )
+    }
   }
 
   fun prepareBatchApproval(jobs: List<VideoJobEntity>): BatchApprovalPreparation {
@@ -506,13 +802,6 @@ class MediaReplacementManager(
     val base = clean.substringBeforeLast('.', clean)
     return "$base.mp4"
   }
-
-  private data class MediaStoreMeta(
-    val displayName: String? = null,
-    val relativePath: String? = null,
-    val dateTakenMs: Long? = null,
-    val dataPath: String? = null,
-  )
 
   private fun queryMediaStoreMetadata(uri: Uri): MediaStoreMeta {
     val cols =

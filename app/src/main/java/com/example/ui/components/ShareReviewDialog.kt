@@ -1,7 +1,6 @@
 package com.example.ui.components
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -10,7 +9,6 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -35,6 +33,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,10 +42,13 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.VideoJobEntity
+import com.example.engine.CompressionPlanCalculator
 import com.example.model.CompressionPreset
 import com.example.model.JobStatus
 import com.example.model.OutputMode
+import com.example.model.ReplacementPermissionStatus
 import com.example.model.TargetResolution
+import com.example.model.VideoCodec
 import com.example.model.VideoCompressionConfig
 import com.example.ui.IncomingShareReviewState
 import com.example.ui.theme.AmberWarning
@@ -66,16 +68,79 @@ fun ShareReviewDialog(
   reviewState: IncomingShareReviewState,
   sharedJobs: List<VideoJobEntity>,
   config: VideoCompressionConfig,
+  hasHardwareEncoder: Boolean = true,
+  preferHardware: Boolean = true,
   onSelectPreset: (CompressionPreset) -> Unit,
   onSelectResolution: (TargetResolution) -> Unit,
+  onSelectCodec: ((VideoCodec) -> Unit)? = null,
   onChangeBitrateKbps: (Int) -> Unit,
   onSelectOutputMode: (OutputMode) -> Unit,
   onReviewInQueue: () -> Unit,
   onConfirmStart: () -> Unit,
 ) {
   val validCount = sharedJobs.count { it.status == JobStatus.QUEUED }
-  val totalBytes = sharedJobs.sumOf { it.originalSizeBytes.coerceAtLeast(0L) }
   val replaceActive = config.isReplaceOriginalActive
+
+  val batchSummary =
+    remember(sharedJobs, config, hasHardwareEncoder, preferHardware) {
+      var origTotal = 0L
+      var minOut = 0L
+      var maxOut = 0L
+      var etaTotal = 0
+      var eligible = 0
+      var readOnly = 0
+      val perJobEst =
+        sharedJobs.associate { job ->
+          if (job.replacementStatus == ReplacementPermissionStatus.READ_ONLY) readOnly++
+          else if (job.status != JobStatus.FAILED) eligible++
+
+          val est =
+            CompressionPlanCalculator.estimateJobCompression(
+              durationMs = job.durationMs,
+              originalSizeBytes = job.originalSizeBytes,
+              sourceWidth = job.width,
+              sourceHeight = job.height,
+              sourceRotation = job.rotation,
+              sourceBitrateBps = job.sourceBitrateBps,
+              sourceFrameRate = job.sourceFrameRate,
+              sourceAudioBitrateBps = job.sourceAudioBitrateBps,
+              preset = config.preset,
+              targetResolution = config.resolution,
+              targetCodec = config.codec,
+              customBitrateKbps = config.customBitrateKbps,
+              hasHardwareEncoder = hasHardwareEncoder,
+              preferHardware = preferHardware,
+            )
+          origTotal += est.originalBytes
+          minOut += est.minOutputBytes
+          maxOut += est.maxOutputBytes
+          etaTotal += est.estimatedProcessingSeconds
+          job.id to est
+        }
+      val minSaved = (origTotal - maxOut).coerceAtLeast(0L)
+      val maxSaved = (origTotal - minOut).coerceAtLeast(0L)
+      val minPct =
+        if (origTotal > 0L) ((minSaved.toDouble() / origTotal) * 100.0).toInt().coerceIn(0, 99) else 0
+      val maxPct =
+        if (origTotal > 0L) ((maxSaved.toDouble() / origTotal) * 100.0).toInt().coerceIn(minPct, 99) else 0
+      Triple(
+        perJobEst,
+        listOf(origTotal, minOut, maxOut, minSaved, maxSaved, minPct.toLong(), maxPct.toLong(), etaTotal.toLong()),
+        eligible to readOnly,
+      )
+    }
+
+  val perJobEstimates = batchSummary.first
+  val metrics = batchSummary.second
+  val totalBytes = metrics[0]
+  val minOutBytes = metrics[1]
+  val maxOutBytes = metrics[2]
+  val minSavedBytes = metrics[3]
+  val maxSavedBytes = metrics[4]
+  val minPct = metrics[5].toInt()
+  val maxPct = metrics[6].toInt()
+  val totalEtaSec = metrics[7].toInt()
+  val (eligibleCount, readOnlyCount) = batchSummary.third
 
   AlertDialog(
     onDismissRequest = onReviewInQueue,
@@ -97,7 +162,7 @@ fun ShareReviewDialog(
         Text(
           text =
             buildString {
-              append("Total: ${FormatUtils.formatBytes(totalBytes)}")
+              append("Original: ${FormatUtils.formatBytes(totalBytes)}")
               if (reviewState.skippedDuplicateCount > 0) {
                 append(" • ${reviewState.skippedDuplicateCount} duplicate skipped")
               }
@@ -112,6 +177,34 @@ fun ShareReviewDialog(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
       ) {
+        // Live Smart Estimator & Eligibility Summary Banner
+        if (maxOutBytes > 0L) {
+          Surface(
+            color = CyanPrimary.copy(alpha = 0.1f),
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, CyanPrimary.copy(alpha = 0.35f)),
+            modifier = Modifier.fillMaxWidth().testTag("share_estimator_summary"),
+          ) {
+            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+              Text(
+                text =
+                  "Est. Output: ${FormatUtils.formatSizeRange(minOutBytes, maxOutBytes)} • Save ${FormatUtils.formatReductionRange(minPct, maxPct)} (${FormatUtils.formatSizeRange(minSavedBytes, maxSavedBytes)})",
+                style = MaterialTheme.typography.labelMedium,
+                color = CyanPrimary,
+              )
+              val etaLabel = if (totalEtaSec > 0) "Est. Time: ${FormatUtils.formatEta(totalEtaSec)}" else ""
+              val eligLabel =
+                if (readOnlyCount > 0) "Eligible: $eligibleCount • Read-only: $readOnlyCount (copies only)"
+                else "Replace Eligible: $eligibleCount"
+              Text(
+                text = listOf(etaLabel, eligLabel).filter { it.isNotBlank() }.joinToString(" • "),
+                style = MaterialTheme.typography.labelSmall,
+                color = if (readOnlyCount > 0) AmberWarning else TextSecondary,
+              )
+            }
+          }
+        }
+
         if (!reviewState.captionText.isNullOrBlank()) {
           Surface(
             color = StudioSurfaceHighlight,
@@ -131,10 +224,11 @@ fun ShareReviewDialog(
 
         // Scrollable list supporting 1, 10, 50+ shared videos smoothly
         LazyColumn(
-          modifier = Modifier.fillMaxWidth().heightIn(max = 190.dp),
+          modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp),
           verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
           items(items = sharedJobs, key = { it.id }) { job ->
+            val est = perJobEstimates[job.id]
             Surface(
               color = StudioSurfaceHighlight,
               shape = RoundedCornerShape(10.dp),
@@ -169,6 +263,21 @@ fun ShareReviewDialog(
                     style = MaterialTheme.typography.labelSmall,
                     color = TextSecondary,
                   )
+                  if (est != null && est.maxOutputBytes > 0L) {
+                    Text(
+                      text =
+                        "Est: ${FormatUtils.formatSizeRange(est.minOutputBytes, est.maxOutputBytes)} (-${FormatUtils.formatReductionRange(est.minReductionPercent, est.maxReductionPercent)})",
+                      style = MaterialTheme.typography.labelSmall,
+                      color = CyanPrimary,
+                    )
+                  }
+                  if (job.replacementStatus == ReplacementPermissionStatus.READ_ONLY) {
+                    Text(
+                      text = "Read-only source • Save Copy only",
+                      style = MaterialTheme.typography.labelSmall,
+                      color = AmberWarning,
+                    )
+                  }
                   if (!job.errorMessage.isNullOrBlank()) {
                     Text(
                       text = job.errorMessage,
@@ -209,6 +318,37 @@ fun ShareReviewDialog(
                   ),
                 modifier = Modifier.testTag("share_preset_${preset.name}"),
               )
+            }
+          }
+        }
+
+        // Codec selector when wired
+        if (onSelectCodec != null) {
+          Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+              text = "Codec",
+              style = MaterialTheme.typography.labelMedium,
+              color = TextSecondary,
+            )
+            FlowRow(
+              horizontalArrangement = Arrangement.spacedBy(6.dp),
+              verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+              VideoCodec.entries.forEach { codec ->
+                val selected = config.codec == codec
+                FilterChip(
+                  selected = selected,
+                  onClick = { onSelectCodec(codec) },
+                  label = { Text(codec.label) },
+                  colors =
+                    FilterChipDefaults.filterChipColors(
+                      selectedContainerColor = CyanPrimary.copy(alpha = 0.2f),
+                      selectedLabelColor = CyanPrimary,
+                      containerColor = StudioSurfaceHighlight,
+                    ),
+                  modifier = Modifier.testTag("share_codec_${codec.name}"),
+                )
+              }
             }
           }
         }
@@ -316,7 +456,12 @@ fun ShareReviewDialog(
                 color = if (replaceActive) EmeraldSuccess else MaterialTheme.colorScheme.onSurface,
               )
               Text(
-                text = "Tap to switch output mode",
+                text =
+                  if (readOnlyCount > 0 && replaceActive) {
+                    "Read-only sources auto-switch to Save Copy"
+                  } else {
+                    "Tap to switch output mode"
+                  },
                 style = MaterialTheme.typography.labelSmall,
                 color = TextMuted,
               )

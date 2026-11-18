@@ -64,6 +64,25 @@ interface VideoJobDao {
     outputMode: com.example.model.OutputMode,
   )
 
+  @Query(
+    """
+    UPDATE video_jobs
+    SET preset = :preset,
+        targetResolution = :targetResolution,
+        targetCodec = :targetCodec,
+        customBitrateKbps = :customBitrateKbps,
+        outputMode = :outputMode
+    WHERE status = 'QUEUED'
+    """
+  )
+  suspend fun updateAllQueuedJobsConfig(
+    preset: com.example.model.CompressionPreset,
+    targetResolution: com.example.model.TargetResolution,
+    targetCodec: com.example.model.VideoCodec,
+    customBitrateKbps: Int,
+    outputMode: com.example.model.OutputMode,
+  )
+
   @Query("UPDATE video_jobs SET sortOrder = :sortOrder WHERE id = :id")
   suspend fun updateSortOrder(id: String, sortOrder: Int)
 
@@ -81,13 +100,28 @@ interface VideoJobDao {
   @Query(
     """
     UPDATE video_jobs
+    SET replacementStatus = :replacementStatus,
+        errorMessage = :errorMessage
+    WHERE id = :id
+    """
+  )
+  suspend fun updateReplacementStatus(
+    id: String,
+    replacementStatus: com.example.model.ReplacementPermissionStatus,
+    errorMessage: String?,
+  )
+
+  @Query(
+    """
+    UPDATE video_jobs
     SET status = 'AWAITING_APPROVAL',
         progressPercent = 100,
         stagedTempPath = :stagedTempPath,
         outputSizeBytes = :outputSizeBytes,
         usedHardwareEncoder = :usedHardwareEncoder,
         encoderName = :encoderName,
-        errorMessage = NULL
+        replacementStatus = :replacementStatus,
+        errorMessage = :errorMessage
     WHERE id = :id
     """
   )
@@ -97,17 +131,24 @@ interface VideoJobDao {
     outputSizeBytes: Long,
     usedHardwareEncoder: Boolean,
     encoderName: String,
+    replacementStatus: com.example.model.ReplacementPermissionStatus,
+    errorMessage: String?,
   )
 
   @Query(
     """
     UPDATE video_jobs
     SET status = 'AWAITING_APPROVAL',
+        replacementStatus = :replacementStatus,
         errorMessage = :errorMessage
     WHERE id = :id
     """
   )
-  suspend fun markAwaitingApprovalError(id: String, errorMessage: String)
+  suspend fun markAwaitingApprovalError(
+    id: String,
+    replacementStatus: com.example.model.ReplacementPermissionStatus,
+    errorMessage: String,
+  )
 
   @Query(
     """
@@ -115,6 +156,7 @@ interface VideoJobDao {
     SET status = 'COMPLETED',
         progressPercent = 100,
         replacedOriginal = :replacedOriginal,
+        replacementStatus = :replacementStatus,
         stagedTempPath = NULL,
         outputUri = :outputUri,
         outputFileName = :outputFileName,
@@ -129,6 +171,7 @@ interface VideoJobDao {
   suspend fun markCompleted(
     id: String,
     replacedOriginal: Boolean,
+    replacementStatus: com.example.model.ReplacementPermissionStatus,
     outputUri: String,
     outputFileName: String,
     outputSizeBytes: Long,

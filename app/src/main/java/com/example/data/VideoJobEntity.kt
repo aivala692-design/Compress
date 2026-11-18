@@ -6,6 +6,7 @@ import androidx.room.TypeConverter
 import com.example.model.CompressionPreset
 import com.example.model.JobStatus
 import com.example.model.OutputMode
+import com.example.model.ReplacementPermissionStatus
 import com.example.model.TargetResolution
 import com.example.model.VideoCodec
 
@@ -20,6 +21,8 @@ data class VideoJobEntity(
   val height: Int,
   val rotation: Int,
   val sourceBitrateBps: Int,
+  val sourceFrameRate: Float = 0f,
+  val sourceAudioBitrateBps: Int = 0,
   val sortOrder: Int,
   val status: JobStatus,
   val progressPercent: Int = 0,
@@ -28,6 +31,10 @@ data class VideoJobEntity(
   val targetCodec: VideoCodec,
   val customBitrateKbps: Int,
   val outputMode: OutputMode = OutputMode.KEEP_ORIGINAL,
+  val replacementStatus: ReplacementPermissionStatus = ReplacementPermissionStatus.NOT_APPLICABLE,
+  val sourceAuthority: String? = null,
+  val sourceRelativePath: String? = null,
+  val sourceDateTakenMs: Long? = null,
   val stagedTempPath: String? = null,
   val replacedOriginal: Boolean = false,
   val outputUri: String? = null,
@@ -71,4 +78,12 @@ class CompressXTypeConverters {
   @TypeConverter
   fun toOutputMode(value: String): OutputMode =
     runCatching { OutputMode.valueOf(value) }.getOrDefault(OutputMode.KEEP_ORIGINAL)
+
+  @TypeConverter
+  fun fromReplacementStatus(value: ReplacementPermissionStatus): String = value.name
+
+  @TypeConverter
+  fun toReplacementStatus(value: String): ReplacementPermissionStatus =
+    runCatching { ReplacementPermissionStatus.valueOf(value) }
+      .getOrDefault(ReplacementPermissionStatus.NOT_APPLICABLE)
 }

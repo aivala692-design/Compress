@@ -44,4 +44,59 @@ object FormatUtils {
       .toInt()
       .coerceIn(-99, 99)
   }
+
+  fun formatSizeRange(minBytes: Long, maxBytes: Long): String {
+    val lo = minOf(minBytes, maxBytes).coerceAtLeast(0L)
+    val hi = maxOf(minBytes, maxBytes).coerceAtLeast(0L)
+    if (lo == 0L && hi == 0L) return "0 MB"
+    val mbDiv = 1024.0 * 1024.0
+    val gbDiv = 1024.0 * 1024.0 * 1024.0
+    if (hi >= 1024.0 * mbDiv) {
+      val loGb = lo / gbDiv
+      val hiGb = hi / gbDiv
+      return if (String.format(Locale.US, "%.2f", loGb) == String.format(Locale.US, "%.2f", hiGb)) {
+        String.format(Locale.US, "%.2f GB", hiGb)
+      } else {
+        String.format(Locale.US, "%.2f–%.2f GB", loGb, hiGb)
+      }
+    }
+    if (hi >= mbDiv) {
+      val loMb = lo / mbDiv
+      val hiMb = hi / mbDiv
+      return if (hiMb >= 10.0) {
+        val loInt = loMb.toInt()
+        val hiInt = kotlin.math.ceil(hiMb).toInt().coerceAtLeast(loInt)
+        if (loInt == hiInt) "$hiInt MB" else "$loInt–$hiInt MB"
+      } else {
+        val loStr = String.format(Locale.US, "%.1f", loMb)
+        val hiStr = String.format(Locale.US, "%.1f", hiMb)
+        if (loStr == hiStr) "$hiStr MB" else "$loStr–$hiStr MB"
+      }
+    }
+    val loKb = (lo / 1024.0).toInt().coerceAtLeast(1)
+    val hiKb = kotlin.math.ceil(hi / 1024.0).toInt().coerceAtLeast(loKb)
+    return if (loKb == hiKb) "$hiKb KB" else "$loKb–$hiKb KB"
+  }
+
+  fun formatReductionRange(minPct: Int, maxPct: Int): String {
+    val lo = minOf(minPct, maxPct)
+    val hi = maxOf(minPct, maxPct)
+    return if (lo == hi) "~$hi%" else "$lo–$hi%"
+  }
+
+  fun formatEta(seconds: Int): String {
+    val safe = seconds.coerceAtLeast(1)
+    if (safe < 60) return "~${safe}s"
+    val mins = safe / 60
+    val remSec = safe % 60
+    return if (mins >= 60) {
+      val hrs = mins / 60
+      val remMin = mins % 60
+      "~${hrs}h ${remMin}m"
+    } else if (remSec == 0) {
+      "~${mins}m"
+    } else {
+      "~${mins}m ${remSec}s"
+    }
+  }
 }

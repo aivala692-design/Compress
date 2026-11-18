@@ -27,12 +27,12 @@ class CompressXApplication : Application() {
 
   val database: CompressXDatabase by lazy { CompressXDatabase.getInstance(this) }
   val preferencesRepository: PreferencesRepository by lazy { PreferencesRepository(this) }
-  val queueRepository: VideoQueueRepository by lazy {
-    VideoQueueRepository(this, database.videoJobDao())
-  }
   val outputStorageWriter: OutputStorageWriter by lazy { OutputStorageWriter(this) }
   val mediaReplacementManager: MediaReplacementManager by lazy {
     MediaReplacementManager(this, outputStorageWriter)
+  }
+  val queueRepository: VideoQueueRepository by lazy {
+    VideoQueueRepository(this, database.videoJobDao(), mediaReplacementManager)
   }
   val compressionEngine: VideoCompressionEngine by lazy {
     VideoCompressionEngine(this, outputStorageWriter)

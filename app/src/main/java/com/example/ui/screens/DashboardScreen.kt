@@ -258,6 +258,25 @@ fun DashboardScreen(
                 color = EmeraldSuccess,
               )
               Spacer(modifier = Modifier.height(10.dp))
+              if (uiState.stats.totalOriginalBytesPending > 0L && uiState.stats.estMaxOutputBytesPending > 0L) {
+                val estOut =
+                  FormatUtils.formatSizeRange(
+                    uiState.stats.estMinOutputBytesPending,
+                    uiState.stats.estMaxOutputBytesPending,
+                  )
+                val estPct =
+                  FormatUtils.formatReductionRange(
+                    uiState.stats.estMinReductionPercentPending,
+                    uiState.stats.estMaxReductionPercentPending,
+                  )
+                Text(
+                  text =
+                    "Queued ${FormatUtils.formatBytes(uiState.stats.totalOriginalBytesPending)} → Est. $estOut (-$estPct • ${FormatUtils.formatEta(uiState.stats.estProcessingSecondsPending)})",
+                  style = MaterialTheme.typography.labelMedium,
+                  color = CyanPrimary,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+              }
               Text(
                 text =
                   "Free space: ${FormatUtils.formatBytes(uiState.guardrails.availableStorageBytes)} • Battery ${uiState.guardrails.batteryPercent}%",

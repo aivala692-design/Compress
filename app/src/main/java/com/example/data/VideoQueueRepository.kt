@@ -2,13 +2,19 @@ package com.example.data
 
 import android.content.Context
 import android.content.Intent
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
 import com.example.engine.CompressionLogger
+import com.example.engine.CompressionPlanCalculator
+import com.example.engine.MediaReplacementManager
+import com.example.engine.OutputStorageWriter
 import com.example.model.BatchSummaryStats
 import com.example.model.JobStatus
 import com.example.model.OutputMode
+import com.example.model.ReplacementPermissionStatus
 import com.example.model.VideoCompressionConfig
 import java.io.File
 import java.util.UUID
@@ -29,6 +35,8 @@ data class EnqueueBatchResult(
 class VideoQueueRepository(
   private val context: Context,
   private val dao: VideoJobDao,
+  val mediaReplacementManager: MediaReplacementManager =
+    MediaReplacementManager(context, OutputStorageWriter(context)),
 ) {
 
   val allJobs: Flow<List<VideoJobEntity>> = dao.observeAllJobs()
@@ -89,7 +97,8 @@ class VideoQueueRepository(
                       )
                     }
                   }
-                  uri to probeVideoMetadata(uri)
+                  val eligibility = mediaReplacementManager.assessEligibility(uri)
+                  Triple(uri, probeVideoMetadata(uri), eligibility)
                 }
               }
             }
@@ -101,7 +110,13 @@ class VideoQueueRepository(
         if (config.isReplaceOriginalActive) OutputMode.REPLACE_ORIGINAL else OutputMode.KEEP_ORIGINAL
 
       val jobs =
-        probedResults.map { (uri, probed) ->
+        probedResults.map { (uri, probed, eligibility) ->
+          val initialPermissionStatus =
+            if (!probed.isValid) {
+              ReplacementPermissionStatus.FAILED
+            } else {
+              eligibility.status
+            }
           VideoJobEntity(
             id = UUID.randomUUID().toString(),
             sourceUri = uri.toString(),
@@ -112,6 +127,8 @@ class VideoQueueRepository(
             height = probed.height,
             rotation = probed.rotation,
             sourceBitrateBps = probed.bitrateBps,
+            sourceFrameRate = probed.frameRate,
+            sourceAudioBitrateBps = probed.audioBitrateBps,
             sortOrder = nextSort++,
             status = if (probed.isValid) JobStatus.QUEUED else JobStatus.FAILED,
             progressPercent = 0,
@@ -120,6 +137,10 @@ class VideoQueueRepository(
             targetCodec = config.codec,
             customBitrateKbps = config.customBitrateKbps,
             outputMode = effectiveMode,
+            replacementStatus = initialPermissionStatus,
+            sourceAuthority = eligibility.authority,
+            sourceRelativePath = eligibility.mediaStoreMeta?.relativePath,
+            sourceDateTakenMs = eligibility.mediaStoreMeta?.dateTakenMs,
             errorMessage = probed.errorMessage,
           )
         }
@@ -148,6 +169,19 @@ class VideoQueueRepository(
       }
     }
 
+  suspend fun applyConfigToAllQueuedJobs(config: VideoCompressionConfig) =
+    withContext(Dispatchers.IO) {
+      val effectiveMode =
+        if (config.isReplaceOriginalActive) OutputMode.REPLACE_ORIGINAL else OutputMode.KEEP_ORIGINAL
+      dao.updateAllQueuedJobsConfig(
+        preset = config.preset,
+        targetResolution = config.resolution,
+        targetCodec = config.codec,
+        customBitrateKbps = config.customBitrateKbps,
+        outputMode = effectiveMode,
+      )
+    }
+
   suspend fun getNextQueuedJob(): VideoJobEntity? = dao.getNextQueuedJob()
 
   suspend fun getAwaitingApprovalJobs(): List<VideoJobEntity> = dao.getAwaitingApprovalJobs()
@@ -161,12 +195,20 @@ class VideoQueueRepository(
 
   suspend fun updateProgress(id: String, progress: Int) = dao.updateProgress(id, progress)
 
+  suspend fun updateReplacementStatus(
+    id: String,
+    replacementStatus: ReplacementPermissionStatus,
+    errorMessage: String? = null,
+  ) = dao.updateReplacementStatus(id, replacementStatus, errorMessage)
+
   suspend fun markAwaitingApproval(
     id: String,
     stagedTempPath: String,
     outputSizeBytes: Long,
     usedHardwareEncoder: Boolean,
     encoderName: String,
+    replacementStatus: ReplacementPermissionStatus = ReplacementPermissionStatus.PENDING_BATCH_APPROVAL,
+    errorMessage: String? = null,
   ) =
     dao.markAwaitingApproval(
       id = id,
@@ -174,10 +216,15 @@ class VideoQueueRepository(
       outputSizeBytes = outputSizeBytes,
       usedHardwareEncoder = usedHardwareEncoder,
       encoderName = encoderName,
+      replacementStatus = replacementStatus,
+      errorMessage = errorMessage,
     )
 
-  suspend fun markAwaitingApprovalError(id: String, errorMessage: String) =
-    dao.markAwaitingApprovalError(id, errorMessage)
+  suspend fun markAwaitingApprovalError(
+    id: String,
+    errorMessage: String,
+    replacementStatus: ReplacementPermissionStatus = ReplacementPermissionStatus.FAILED,
+  ) = dao.markAwaitingApprovalError(id, replacementStatus, errorMessage)
 
   suspend fun markCompleted(
     id: String,
@@ -187,10 +234,13 @@ class VideoQueueRepository(
     outputSizeBytes: Long,
     usedHardwareEncoder: Boolean,
     encoderName: String,
+    replacementStatus: ReplacementPermissionStatus =
+      if (replacedOriginal) ReplacementPermissionStatus.REPLACED else ReplacementPermissionStatus.SAVED_COPY,
   ) =
     dao.markCompleted(
       id = id,
       replacedOriginal = replacedOriginal,
+      replacementStatus = replacementStatus,
       outputUri = outputUri,
       outputFileName = outputFileName,
       outputSizeBytes = outputSizeBytes,
@@ -252,7 +302,11 @@ class VideoQueueRepository(
     dao.clearAllJobs()
   }
 
-  fun computeStats(jobs: List<VideoJobEntity>): BatchSummaryStats {
+  fun computeStats(
+    jobs: List<VideoJobEntity>,
+    hasHardwareEncoder: Boolean = true,
+    preferHardware: Boolean = true,
+  ): BatchSummaryStats {
     var queued = 0
     var processing = 0
     var paused = 0
@@ -260,20 +314,109 @@ class VideoQueueRepository(
     var completed = 0
     var replaced = 0
     var failed = 0
+    var replaceEligible = 0
+    var readOnly = 0
     var originalCompleted = 0L
     var outputCompleted = 0L
+    var originalPending = 0L
+    var estMinOutPending = 0L
+    var estMaxOutPending = 0L
+    var estProcessingSecPending = 0
     var activeProgressSum = 0
 
     for (job in jobs) {
+      when (job.replacementStatus) {
+        ReplacementPermissionStatus.ELIGIBLE,
+        ReplacementPermissionStatus.PENDING_BATCH_APPROVAL,
+        ReplacementPermissionStatus.BATCH_APPROVED,
+        ReplacementPermissionStatus.DENIED -> {
+          if (job.status != JobStatus.FAILED && job.status != JobStatus.CANCELLED) {
+            replaceEligible++
+          }
+        }
+        ReplacementPermissionStatus.READ_ONLY -> {
+          if (job.status != JobStatus.COMPLETED && job.status != JobStatus.CANCELLED) {
+            readOnly++
+          }
+        }
+        else -> Unit
+      }
+
       when (job.status) {
-        JobStatus.QUEUED -> queued++
+        JobStatus.QUEUED -> {
+          queued++
+          val est =
+            CompressionPlanCalculator.estimateJobCompression(
+              durationMs = job.durationMs,
+              originalSizeBytes = job.originalSizeBytes,
+              sourceWidth = job.width,
+              sourceHeight = job.height,
+              sourceRotation = job.rotation,
+              sourceBitrateBps = job.sourceBitrateBps,
+              sourceFrameRate = job.sourceFrameRate,
+              sourceAudioBitrateBps = job.sourceAudioBitrateBps,
+              preset = job.preset,
+              targetResolution = job.targetResolution,
+              targetCodec = job.targetCodec,
+              customBitrateKbps = job.customBitrateKbps,
+              hasHardwareEncoder = hasHardwareEncoder,
+              preferHardware = preferHardware,
+            )
+          originalPending += est.originalBytes
+          estMinOutPending += est.minOutputBytes
+          estMaxOutPending += est.maxOutputBytes
+          estProcessingSecPending += est.estimatedProcessingSeconds
+        }
         JobStatus.PROCESSING -> {
           processing++
           activeProgressSum += job.progressPercent
+          val est =
+            CompressionPlanCalculator.estimateJobCompression(
+              durationMs = job.durationMs,
+              originalSizeBytes = job.originalSizeBytes,
+              sourceWidth = job.width,
+              sourceHeight = job.height,
+              sourceRotation = job.rotation,
+              sourceBitrateBps = job.sourceBitrateBps,
+              sourceFrameRate = job.sourceFrameRate,
+              sourceAudioBitrateBps = job.sourceAudioBitrateBps,
+              preset = job.preset,
+              targetResolution = job.targetResolution,
+              targetCodec = job.targetCodec,
+              customBitrateKbps = job.customBitrateKbps,
+              hasHardwareEncoder = hasHardwareEncoder,
+              preferHardware = preferHardware,
+            )
+          originalPending += est.originalBytes
+          estMinOutPending += est.minOutputBytes
+          estMaxOutPending += est.maxOutputBytes
+          estProcessingSecPending +=
+            ((est.estimatedProcessingSeconds * (100 - job.progressPercent)) / 100.0).toInt()
         }
         JobStatus.PAUSED -> {
           paused++
           activeProgressSum += job.progressPercent
+          val est =
+            CompressionPlanCalculator.estimateJobCompression(
+              durationMs = job.durationMs,
+              originalSizeBytes = job.originalSizeBytes,
+              sourceWidth = job.width,
+              sourceHeight = job.height,
+              sourceRotation = job.rotation,
+              sourceBitrateBps = job.sourceBitrateBps,
+              sourceFrameRate = job.sourceFrameRate,
+              sourceAudioBitrateBps = job.sourceAudioBitrateBps,
+              preset = job.preset,
+              targetResolution = job.targetResolution,
+              targetCodec = job.targetCodec,
+              customBitrateKbps = job.customBitrateKbps,
+              hasHardwareEncoder = hasHardwareEncoder,
+              preferHardware = preferHardware,
+            )
+          originalPending += est.originalBytes
+          estMinOutPending += est.minOutputBytes
+          estMaxOutPending += est.maxOutputBytes
+          estProcessingSecPending += est.estimatedProcessingSeconds
         }
         JobStatus.AWAITING_APPROVAL -> {
           awaitingApproval++
@@ -294,6 +437,14 @@ class VideoQueueRepository(
     val totalWorkItems = queued + processing + paused + awaitingApproval + completed
     val overallProgress =
       if (totalWorkItems > 0) (activeProgressSum / totalWorkItems).coerceIn(0, 100) else 0
+    val minSavedPending = (originalPending - estMaxOutPending).coerceAtLeast(0L)
+    val maxSavedPending = (originalPending - estMinOutPending).coerceAtLeast(0L)
+    val minPctPending =
+      if (originalPending > 0L) ((minSavedPending.toDouble() / originalPending.toDouble()) * 100.0).toInt().coerceIn(0, 99)
+      else 0
+    val maxPctPending =
+      if (originalPending > 0L) ((maxSavedPending.toDouble() / originalPending.toDouble()) * 100.0).toInt().coerceIn(minPctPending, 99)
+      else 0
 
     return BatchSummaryStats(
       queuedCount = queued,
@@ -303,8 +454,18 @@ class VideoQueueRepository(
       completedCount = completed,
       replacedCount = replaced,
       failedCount = failed,
+      replaceEligibleCount = replaceEligible,
+      readOnlyCount = readOnly,
       totalOriginalBytesCompleted = originalCompleted,
       totalOutputBytesCompleted = outputCompleted,
+      totalOriginalBytesPending = originalPending,
+      estMinOutputBytesPending = estMinOutPending,
+      estMaxOutputBytesPending = estMaxOutPending,
+      estMinSavedBytesPending = minSavedPending,
+      estMaxSavedBytesPending = maxSavedPending,
+      estMinReductionPercentPending = minPctPending,
+      estMaxReductionPercentPending = maxPctPending,
+      estProcessingSecondsPending = estProcessingSecPending,
       overallProgressPercent = overallProgress,
     )
   }
@@ -317,6 +478,8 @@ class VideoQueueRepository(
     val height: Int,
     val rotation: Int,
     val bitrateBps: Int,
+    val frameRate: Float,
+    val audioBitrateBps: Int,
     val isValid: Boolean,
     val errorMessage: String?,
   )
@@ -372,6 +535,31 @@ class VideoQueueRepository(
         }.getOrDefault(0L)
     }
 
+    // Extract track frame rate & audio bitrate cleanly when container exposes them
+    var detectedFps = 0f
+    var detectedAudioBps = 0
+    val extractor = MediaExtractor()
+    try {
+      extractor.setDataSource(context, uri, null)
+      for (idx in 0 until extractor.trackCount) {
+        val format = extractor.getTrackFormat(idx)
+        val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
+        if (mime.startsWith("video/") && detectedFps <= 0f && format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+          detectedFps =
+            runCatching { format.getInteger(MediaFormat.KEY_FRAME_RATE).toFloat() }
+              .getOrElse {
+                runCatching { format.getFloat(MediaFormat.KEY_FRAME_RATE) }.getOrDefault(0f)
+              }
+        } else if (mime.startsWith("audio/") && detectedAudioBps <= 0 && format.containsKey(MediaFormat.KEY_BIT_RATE)) {
+          detectedAudioBps = runCatching { format.getInteger(MediaFormat.KEY_BIT_RATE) }.getOrDefault(0)
+        }
+      }
+    } catch (_: Throwable) {
+      // Non-fatal; MediaMetadataRetriever handles fallback
+    } finally {
+      runCatching { extractor.release() }
+    }
+
     val retriever = MediaMetadataRetriever()
     return try {
       retriever.setDataSource(context, uri)
@@ -387,6 +575,11 @@ class VideoQueueRepository(
           ?: 0
       val bitrate =
         retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
+      if (detectedFps <= 0f) {
+        detectedFps =
+          retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+            ?.toFloatOrNull() ?: 0f
+      }
       if (displayName.startsWith("shared_video_")) {
         retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
           ?.trim()
@@ -405,6 +598,8 @@ class VideoQueueRepository(
           height = height,
           rotation = rotation,
           bitrateBps = bitrate,
+          frameRate = detectedFps,
+          audioBitrateBps = detectedAudioBps,
           isValid = false,
           errorMessage = "Unsupported or corrupt video stream (no valid video track)",
         )
@@ -417,6 +612,8 @@ class VideoQueueRepository(
           height = height,
           rotation = rotation,
           bitrateBps = bitrate,
+          frameRate = detectedFps,
+          audioBitrateBps = detectedAudioBps,
           isValid = true,
           errorMessage = null,
         )
@@ -430,6 +627,8 @@ class VideoQueueRepository(
         height = 0,
         rotation = 0,
         bitrateBps = 0,
+        frameRate = detectedFps,
+        audioBitrateBps = detectedAudioBps,
         isValid = false,
         errorMessage = t.message ?: "Unable to read video metadata",
       )

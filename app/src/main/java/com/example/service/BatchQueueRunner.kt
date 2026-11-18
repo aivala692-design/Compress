@@ -148,6 +148,8 @@ class BatchQueueRunner(
           targetResolution = nextJob.targetResolution,
           targetCodec = nextJob.targetCodec,
           customBitrateKbps = nextJob.customBitrateKbps,
+          originalSizeBytes = nextJob.originalSizeBytes,
+          durationMs = nextJob.durationMs,
         )
 
       val effectiveOutputMode =
@@ -194,13 +196,22 @@ class BatchQueueRunner(
 
         val stagedPath = result.stagedTempPath
         if (effectiveOutputMode == OutputMode.REPLACE_ORIGINAL && !stagedPath.isNullOrBlank()) {
-          // Never delete or overwrite the original automatically without user consent/system confirmation
+          // Assess whether the source URI supports batch replacement or is read-only
+          val assessment = repo.mediaReplacementManager.assessEligibility(Uri.parse(nextJob.sourceUri))
+          val awaitingStatus =
+            if (assessment.status == com.example.model.ReplacementPermissionStatus.READ_ONLY) {
+              com.example.model.ReplacementPermissionStatus.READ_ONLY
+            } else {
+              com.example.model.ReplacementPermissionStatus.PENDING_BATCH_APPROVAL
+            }
           repo.markAwaitingApproval(
             id = nextJob.id,
             stagedTempPath = stagedPath,
             outputSizeBytes = result.outputSizeBytes,
             usedHardwareEncoder = result.usedHardwareEncoder,
             encoderName = result.encoderName,
+            replacementStatus = awaitingStatus,
+            errorMessage = assessment.readOnlyReason,
           )
           sessionAwaitingApproval++
         } else {
@@ -212,6 +223,7 @@ class BatchQueueRunner(
             outputSizeBytes = result.outputSizeBytes,
             usedHardwareEncoder = result.usedHardwareEncoder,
             encoderName = result.encoderName,
+            replacementStatus = com.example.model.ReplacementPermissionStatus.SAVED_COPY,
           )
           sessionCompleted++
           sessionSavedBytes += (nextJob.originalSizeBytes - result.outputSizeBytes).coerceAtLeast(0L)

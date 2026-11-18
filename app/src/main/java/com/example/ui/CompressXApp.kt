@@ -220,28 +220,30 @@ fun CompressXApp(
   }
 
   // Official Android MediaStore batch/recoverable write approval launcher (Android 10-15)
-  var activePendingApprovalIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+  var activePendingRequest by remember { mutableStateOf<PendingSystemApprovalRequest?>(null) }
   val systemApprovalLauncher =
     rememberLauncherForActivityResult(
       contract = ActivityResultContracts.StartIntentSenderForResult(),
     ) { result ->
-      val jobIds = activePendingApprovalIds
-      activePendingApprovalIds = emptySet()
-      viewModel.onSystemReplacementApprovalResult(
-        granted = result.resultCode == Activity.RESULT_OK,
-        jobIds = jobIds,
-      )
+      val req = activePendingRequest
+      activePendingRequest = null
+      if (req != null) {
+        viewModel.onSystemReplacementApprovalResult(
+          granted = result.resultCode == Activity.RESULT_OK,
+          request = req,
+        )
+      }
     }
 
   LaunchedEffect(uiState.pendingSystemApproval) {
     val req = uiState.pendingSystemApproval ?: return@LaunchedEffect
-    activePendingApprovalIds = req.approvedJobIds
+    activePendingRequest = req
     try {
       systemApprovalLauncher.launch(IntentSenderRequest.Builder(req.intentSender).build())
     } catch (t: Throwable) {
       com.example.engine.CompressionLogger.e("CompressXUI", "Failed launching Android approval dialog", t)
-      activePendingApprovalIds = emptySet()
-      viewModel.onSystemReplacementApprovalResult(granted = false, jobIds = req.approvedJobIds)
+      activePendingRequest = null
+      viewModel.onSystemReplacementApprovalResult(granted = false, request = req)
     }
   }
 
@@ -395,6 +397,7 @@ fun CompressXApp(
             QueueScreen(
               uiState = uiState,
               onSelectFilter = { viewModel.selectFilter(it) },
+              onSelectPreset = { viewModel.selectPreset(it) },
               onAddVideos = launchPhotoPicker,
               onAddSafVideos = launchSafPicker,
               onStartOrResume = startBatchWithNotificationCheck,
@@ -406,7 +409,10 @@ fun CompressXApp(
               onDeleteJob = { viewModel.deleteJob(it) },
               onClearCompleted = { viewModel.clearCompleted() },
               onClearAll = { viewModel.clearAllQueue() },
+              onToggleApprovalSelect = { viewModel.toggleApprovalSelection(it) },
+              onSelectAllEligible = { viewModel.selectAllEligibleForReplacement() },
               onOpenBatchReplace = { viewModel.openBatchReplaceDialog() },
+              onSaveAllReadOnlyCopies = { viewModel.saveAllReadOnlyAsCopies() },
               onSaveAllCopies = { viewModel.saveAllStagedAsCopies() },
               onApproveReplace = { jobId -> viewModel.approveAndReplaceJobs(setOf(jobId)) },
               onSaveCopyInstead = { jobId -> viewModel.saveStagedJobAsCopy(jobId) },
@@ -453,8 +459,11 @@ fun CompressXApp(
       reviewState = activeShareReview,
       sharedJobs = uiState.sharedReviewJobs,
       config = uiState.config,
+      hasHardwareEncoder = uiState.capabilities?.hasAnyHardwareEncoder == true,
+      preferHardware = uiState.config.preferHardwareAcceleration,
       onSelectPreset = { viewModel.selectPreset(it) },
       onSelectResolution = { viewModel.selectResolution(it) },
+      onSelectCodec = { viewModel.selectCodec(it) },
       onChangeBitrateKbps = { viewModel.updateCustomBitrateKbps(it) },
       onSelectOutputMode = { viewModel.onSelectOutputMode(it) },
       onReviewInQueue = {
@@ -529,11 +538,15 @@ fun CompressXApp(
     )
   }
 
-  // Batch Replacement Confirmation Dialog (for verified videos awaiting approval)
-  if (uiState.showBatchReplaceDialog && uiState.awaitingApprovalJobs.isNotEmpty()) {
-    val awaitingJobs = uiState.awaitingApprovalJobs
-    val totalOrig = awaitingJobs.sumOf { it.originalSizeBytes }
-    val totalComp = awaitingJobs.sumOf { it.outputSizeBytes }
+  // Centralized Batch Replacement Confirmation Dialog (for eligible verified videos awaiting approval)
+  if (uiState.showBatchReplaceDialog && uiState.eligibleAwaitingApprovalJobs.isNotEmpty()) {
+    val eligibleJobs =
+      uiState.eligibleAwaitingApprovalJobs.filter {
+        uiState.selectedApprovalJobIds.isEmpty() || it.id in uiState.selectedApprovalJobIds
+      }
+    val readOnlyCount = uiState.readOnlyAwaitingApprovalJobs.size
+    val totalOrig = eligibleJobs.sumOf { it.originalSizeBytes }
+    val totalComp = eligibleJobs.sumOf { it.outputSizeBytes }
     val freed = (totalOrig - totalComp).coerceAtLeast(0L)
 
     AlertDialog(
@@ -548,7 +561,7 @@ fun CompressXApp(
       },
       title = {
         Text(
-          text = "Replace ${awaitingJobs.size} Original Video${if (awaitingJobs.size == 1) "" else "s"}?",
+          text = "Replace ${eligibleJobs.size} Eligible Original${if (eligibleJobs.size == 1) "" else "s"}?",
           color = MaterialTheme.colorScheme.onSurface,
         )
       },
@@ -556,11 +569,19 @@ fun CompressXApp(
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
           Text(
             text =
-              "Compressed outputs passed playability checks and will free ${FormatUtils.formatBytes(freed)}. Android may prompt for system confirmation before updating MediaStore.",
+              "All compressed files passed playability verification and will free ${FormatUtils.formatBytes(freed)}. Android will prompt ONCE in a single batch dialog before replacing MediaStore originals.",
             style = MaterialTheme.typography.bodyMedium,
             color = TextSecondary,
           )
-          awaitingJobs.take(5).forEach { job ->
+          if (readOnlyCount > 0) {
+            Text(
+              text =
+                "$readOnlyCount read-only source video(s) are excluded and remain untouched — tap Save Read-Only Copies for them.",
+              style = MaterialTheme.typography.labelSmall,
+              color = AmberWarning,
+            )
+          }
+          eligibleJobs.take(5).forEach { job ->
             Text(
               text =
                 "• ${job.fileName}: ${FormatUtils.formatBytes(job.originalSizeBytes)} → ${FormatUtils.formatBytes(job.outputSizeBytes)}",
@@ -570,9 +591,9 @@ fun CompressXApp(
               overflow = TextOverflow.Ellipsis,
             )
           }
-          if (awaitingJobs.size > 5) {
+          if (eligibleJobs.size > 5) {
             Text(
-              text = "+${awaitingJobs.size - 5} more verified video(s)",
+              text = "+${eligibleJobs.size - 5} more verified video(s)",
               style = MaterialTheme.typography.labelSmall,
               color = AmberWarning,
             )
@@ -581,7 +602,7 @@ fun CompressXApp(
       },
       confirmButton = {
         Button(
-          onClick = { viewModel.approveAndReplaceJobs() },
+          onClick = { viewModel.approveAndReplaceJobs(eligibleJobs.map { it.id }.toSet()) },
           colors =
             ButtonDefaults.buttonColors(
               containerColor = EmeraldSuccess,
@@ -589,7 +610,7 @@ fun CompressXApp(
             ),
           modifier = Modifier.testTag("confirm_batch_replace_button"),
         ) {
-          Text("Approve & Replace")
+          Text("Approve All (${eligibleJobs.size})")
         }
       },
       dismissButton = {

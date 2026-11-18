@@ -66,6 +66,31 @@ enum class JobStatus {
   CANCELLED,
 }
 
+enum class ReplacementPermissionStatus(val label: String) {
+  NOT_APPLICABLE("Standard"),
+  ELIGIBLE("Replace Eligible"),
+  READ_ONLY("Read-Only"),
+  PENDING_BATCH_APPROVAL("Needs Approval"),
+  BATCH_APPROVED("Approved"),
+  DENIED("Denied"),
+  REPLACED("Replaced"),
+  SAVED_COPY("Saved Copy"),
+  FAILED("Failed"),
+}
+
+data class CompressionEstimate(
+  val originalBytes: Long,
+  val minOutputBytes: Long,
+  val maxOutputBytes: Long,
+  val minSavedBytes: Long,
+  val maxSavedBytes: Long,
+  val minReductionPercent: Int,
+  val maxReductionPercent: Int,
+  val estimatedProcessingSeconds: Int,
+  val targetVideoBitrateBps: Int,
+  val targetAudioBitrateBps: Int,
+)
+
 data class VideoCompressionConfig(
   val preset: CompressionPreset = CompressionPreset.BALANCED,
   val resolution: TargetResolution = TargetResolution.FHD_1080P,
@@ -119,8 +144,18 @@ data class BatchSummaryStats(
   val completedCount: Int = 0,
   val replacedCount: Int = 0,
   val failedCount: Int = 0,
+  val replaceEligibleCount: Int = 0,
+  val readOnlyCount: Int = 0,
   val totalOriginalBytesCompleted: Long = 0L,
   val totalOutputBytesCompleted: Long = 0L,
+  val totalOriginalBytesPending: Long = 0L,
+  val estMinOutputBytesPending: Long = 0L,
+  val estMaxOutputBytesPending: Long = 0L,
+  val estMinSavedBytesPending: Long = 0L,
+  val estMaxSavedBytesPending: Long = 0L,
+  val estMinReductionPercentPending: Int = 0,
+  val estMaxReductionPercentPending: Int = 0,
+  val estProcessingSecondsPending: Int = 0,
   val overallProgressPercent: Int = 0,
 ) {
   val totalSavedBytes: Long

@@ -9,6 +9,8 @@ import androidx.lifecycle.viewModelScope
 import com.example.CompressXApplication
 import com.example.data.VideoJobEntity
 import com.example.engine.CompressionLogger
+import com.example.engine.MediaStoreMeta
+import com.example.engine.ParsedSharePayload
 import com.example.engine.ReplacementOutcome
 import com.example.model.BatchSummaryStats
 import com.example.model.CodecCapabilities
@@ -16,12 +18,12 @@ import com.example.model.CompressionPreset
 import com.example.model.GuardrailState
 import com.example.model.JobStatus
 import com.example.model.OutputMode
+import com.example.model.ReplacementPermissionStatus
 import com.example.model.TargetResolution
 import com.example.model.VideoCodec
 import com.example.model.VideoCompressionConfig
 import com.example.service.CompressionForegroundService
 import com.example.ui.components.FormatUtils
-import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -34,8 +36,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-import com.example.engine.ParsedSharePayload
-
 enum class QueueFilter(val label: String) {
   ALL("All"),
   QUEUED("Queued"),
@@ -45,9 +45,18 @@ enum class QueueFilter(val label: String) {
   FAILED("Failed"),
 }
 
+enum class SystemApprovalKind {
+  BATCH_MEDIASTORE_DELETE,
+  LEGACY_SINGLE_WRITE,
+}
+
 data class PendingSystemApprovalRequest(
   val intentSender: IntentSender,
+  val kind: SystemApprovalKind,
   val approvedJobIds: Set<String>,
+  val snapshots: Map<String, MediaStoreMeta> = emptyMap(),
+  val directSafJobIds: Set<String> = emptySet(),
+  val legacyJobIds: Set<String> = emptySet(),
 )
 
 data class IncomingShareReviewState(
@@ -64,6 +73,7 @@ data class StudioUiState(
   val capabilities: CodecCapabilities? = null,
   val guardrails: GuardrailState = GuardrailState(),
   val selectedFilter: QueueFilter = QueueFilter.ALL,
+  val selectedApprovalJobIds: Set<String> = emptySet(),
   val isImportingVideos: Boolean = false,
   val isApplyingReplacements: Boolean = false,
   val showReplaceConsentDialog: Boolean = false,
@@ -80,6 +90,14 @@ data class StudioUiState(
 
   val awaitingApprovalJobs: List<VideoJobEntity>
     get() = jobs.filter { it.status == JobStatus.AWAITING_APPROVAL }
+
+  val eligibleAwaitingApprovalJobs: List<VideoJobEntity>
+    get() =
+      awaitingApprovalJobs.filter { it.replacementStatus != ReplacementPermissionStatus.READ_ONLY }
+
+  val readOnlyAwaitingApprovalJobs: List<VideoJobEntity>
+    get() =
+      awaitingApprovalJobs.filter { it.replacementStatus == ReplacementPermissionStatus.READ_ONLY }
 
   val sharedReviewJobs: List<VideoJobEntity>
     get() {
@@ -98,6 +116,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
   private val replacementManager = app.mediaReplacementManager
 
   private val selectedFilter = MutableStateFlow(QueueFilter.ALL)
+  private val selectedApprovalJobIds = MutableStateFlow<Set<String>>(emptySet())
   private val isImporting = MutableStateFlow(false)
   private val isApplyingReplacements = MutableStateFlow(false)
   private val showReplaceConsentDialog = MutableStateFlow(false)
@@ -108,6 +127,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
   private val guardrailsFlow = MutableStateFlow(guardrailsMonitor.sample())
 
   private var prevProcessingCount = 0
+  private var knownEligibleAwaitingIds = emptySet<String>()
 
   val uiState: StateFlow<StudioUiState> =
     combine(
@@ -115,6 +135,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       queueRepo.completedHistory,
       prefsRepo.configFlow,
       selectedFilter,
+      selectedApprovalJobIds,
       isImporting,
       isApplyingReplacements,
       showReplaceConsentDialog,
@@ -130,18 +151,47 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       val history = values[1] as List<VideoJobEntity>
       val config = values[2] as VideoCompressionConfig
       val filter = values[3] as QueueFilter
-      val importing = values[4] as Boolean
-      val replacing = values[5] as Boolean
-      val showConsent = values[6] as Boolean
-      val showBatchConfirm = values[7] as Boolean
-      val shareReview = values[8] as IncomingShareReviewState?
-      val sysApproval = values[9] as PendingSystemApprovalRequest?
-      val banner = values[10] as String?
-      val guardrails = values[11] as GuardrailState
+      @Suppress("UNCHECKED_CAST")
+      val selectedApproval = values[4] as Set<String>
+      val importing = values[5] as Boolean
+      val replacing = values[6] as Boolean
+      val showConsent = values[7] as Boolean
+      val showBatchConfirm = values[8] as Boolean
+      val shareReview = values[9] as IncomingShareReviewState?
+      val sysApproval = values[10] as PendingSystemApprovalRequest?
+      val banner = values[11] as String?
+      val guardrails = values[12] as GuardrailState
 
-      val stats = queueRepo.computeStats(jobs)
+      val stats =
+        queueRepo.computeStats(
+          jobs = jobs,
+          hasHardwareEncoder = app.codecCapabilities.hasAnyHardwareEncoder,
+          preferHardware = config.preferHardwareAcceleration,
+        )
+
+      val currentEligibleIds =
+        jobs
+          .filter {
+            it.status == JobStatus.AWAITING_APPROVAL &&
+              it.replacementStatus != ReplacementPermissionStatus.READ_ONLY
+          }
+          .map { it.id }
+          .toSet()
+
+      val newlyArrivedEligible = currentEligibleIds - knownEligibleAwaitingIds
+      val sanitizedSelection = (selectedApproval intersect currentEligibleIds) + newlyArrivedEligible
+      if (sanitizedSelection != selectedApproval) {
+        selectedApprovalJobIds.value = sanitizedSelection
+      }
+      knownEligibleAwaitingIds = currentEligibleIds
+
       if (prevProcessingCount > 0 && stats.processingCount == 0 && stats.awaitingApprovalCount > 0) {
-        showBatchReplaceDialog.value = true
+        if (currentEligibleIds.isNotEmpty()) {
+          showBatchReplaceDialog.value = true
+        } else {
+          bannerMessage.value =
+            "Compressed outputs ready. Read-only sources kept intact — tap Save Copies."
+        }
       }
       prevProcessingCount = stats.processingCount
 
@@ -153,6 +203,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
         capabilities = app.codecCapabilities,
         guardrails = guardrails,
         selectedFilter = filter,
+        selectedApprovalJobIds = sanitizedSelection,
         isImportingVideos = importing,
         isApplyingReplacements = replacing,
         showReplaceConsentDialog = showConsent,
@@ -211,14 +262,15 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
         val current = prefsRepo.configFlow.first()
         if (current.replaceOriginalConsentGranted) {
           prefsRepo.updateOutputMode(OutputMode.REPLACE_ORIGINAL)
-          syncShareReviewJobsWithLatestConfig()
-          bannerMessage.value = "Replace Original Mode active — originals replaced after verification & approval."
+          syncAllQueuedJobsWithLatestConfig()
+          bannerMessage.value =
+            "Replace Original Mode active — originals replaced after verification & approval."
         } else {
           showReplaceConsentDialog.value = true
         }
       } else {
         prefsRepo.updateOutputMode(OutputMode.KEEP_ORIGINAL)
-        syncShareReviewJobsWithLatestConfig()
+        syncAllQueuedJobsWithLatestConfig()
         bannerMessage.value = "Keep Original Mode active — compressed copies saved separately."
       }
     }
@@ -228,8 +280,9 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
     viewModelScope.launch {
       prefsRepo.updateOutputMode(OutputMode.REPLACE_ORIGINAL, consentGranted = true)
       showReplaceConsentDialog.value = false
-      syncShareReviewJobsWithLatestConfig()
-      bannerMessage.value = "Replace Original Mode enabled. Originals are only replaced after verification & approval."
+      syncAllQueuedJobsWithLatestConfig()
+      bannerMessage.value =
+        "Replace Original Mode enabled. Originals are only replaced after verification & approval."
     }
   }
 
@@ -237,9 +290,42 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
     showReplaceConsentDialog.value = false
   }
 
+  fun toggleApprovalSelection(jobId: String) {
+    val job = uiState.value.jobs.firstOrNull { it.id == jobId } ?: return
+    if (job.status != JobStatus.AWAITING_APPROVAL) return
+    if (job.replacementStatus == ReplacementPermissionStatus.READ_ONLY) {
+      bannerMessage.value =
+        job.errorMessage
+          ?: "Read-only source provider does not support replacement. Tap Save Copy instead."
+      return
+    }
+    val current = selectedApprovalJobIds.value
+    selectedApprovalJobIds.value = if (jobId in current) current - jobId else current + jobId
+  }
+
+  fun selectAllEligibleForReplacement() {
+    val eligibleIds =
+      uiState.value.eligibleAwaitingApprovalJobs.map { it.id }.toSet()
+    selectedApprovalJobIds.value = eligibleIds
+    if (eligibleIds.isEmpty()) {
+      val readOnlyCount = uiState.value.readOnlyAwaitingApprovalJobs.size
+      if (readOnlyCount > 0) {
+        bannerMessage.value =
+          "$readOnlyCount read-only video(s) cannot replace originals — tap Save Read-Only Copies."
+      }
+    }
+  }
+
   fun openBatchReplaceDialog() {
-    if (uiState.value.awaitingApprovalJobs.isNotEmpty()) {
+    val eligible = uiState.value.eligibleAwaitingApprovalJobs
+    if (eligible.isNotEmpty()) {
+      if (selectedApprovalJobIds.value.isEmpty()) {
+        selectedApprovalJobIds.value = eligible.map { it.id }.toSet()
+      }
       showBatchReplaceDialog.value = true
+    } else if (uiState.value.readOnlyAwaitingApprovalJobs.isNotEmpty()) {
+      bannerMessage.value =
+        "All pending items come from read-only providers — tap Save Read-Only Copies instead."
     }
   }
 
@@ -255,45 +341,66 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       isApplyingReplacements.value = true
       try {
         val allAwaiting = withContext(Dispatchers.IO) { queueRepo.getAwaitingApprovalJobs() }
+        val activeSelection = selectedApprovalJobIds.value
         val candidates =
-          if (targetJobIds == null) allAwaiting
-          else allAwaiting.filter { it.id in targetJobIds }
+          when {
+            targetJobIds != null -> allAwaiting.filter { it.id in targetJobIds }
+            activeSelection.isNotEmpty() -> allAwaiting.filter { it.id in activeSelection }
+            else -> allAwaiting
+          }
 
         if (candidates.isEmpty()) {
-          bannerMessage.value = "No verified videos awaiting replacement."
+          bannerMessage.value = "No verified eligible videos selected for replacement."
           return@launch
         }
 
-        val prep = withContext(Dispatchers.IO) { replacementManager.prepareBatchApproval(candidates) }
+        val prep = withContext(Dispatchers.IO) { replacementManager.prepareBatchDeleteApproval(candidates) }
 
-        // Surface explicit errors for any read-only/unsupported URIs while keeping originals untouched
-        for ((badJob, reason) in prep.unsupportedJobs) {
-          queueRepo.markAwaitingApprovalError(badJob.id, reason)
+        // Surface explicit Read-Only / verification statuses without requesting doomed permissions
+        for ((badJob, reason) in prep.readOnlyOrFailedJobs) {
+          val assessment =
+            withContext(Dispatchers.IO) {
+              replacementManager.assessEligibility(Uri.parse(badJob.sourceUri))
+            }
+          val permStatus =
+            if (assessment.status == ReplacementPermissionStatus.READ_ONLY) {
+              ReplacementPermissionStatus.READ_ONLY
+            } else {
+              ReplacementPermissionStatus.FAILED
+            }
+          queueRepo.markAwaitingApprovalError(badJob.id, reason, permStatus)
         }
 
-        if (prep.mediaStoreIntentSender != null) {
-          // Official Android MediaStore batch approval dialog (Android 11-15)
-          val approvedSet = prep.mediaStoreJobIds + prep.directSafJobs.map { it.id }.toSet()
+        if (prep.deleteRequestIntentSender != null && prep.deleteApprovedJobIds.isNotEmpty()) {
+          // Centralized ONE-dialog MediaStore.createDeleteRequest() on Android 11+ (API 30+)
+          for (id in prep.deleteApprovedJobIds) {
+            queueRepo.updateReplacementStatus(id, ReplacementPermissionStatus.PENDING_BATCH_APPROVAL, null)
+          }
           pendingSystemApproval.value =
             PendingSystemApprovalRequest(
-              intentSender = prep.mediaStoreIntentSender,
-              approvedJobIds = approvedSet,
+              intentSender = prep.deleteRequestIntentSender,
+              kind = SystemApprovalKind.BATCH_MEDIASTORE_DELETE,
+              approvedJobIds = prep.deleteApprovedJobIds,
+              snapshots = prep.snapshots,
+              directSafJobIds = prep.directSafJobs.map { it.id }.toSet(),
+              legacyJobIds = prep.legacyMediaStoreJobs.map { it.id }.toSet(),
             )
           return@launch
         }
 
-        val actionable = candidates.filter { it.id !in prep.unsupportedJobs.map { p -> p.first.id }.toSet() }
-        if (actionable.isEmpty()) {
+        val directAndLegacy = prep.directSafJobs + prep.legacyMediaStoreJobs
+        if (directAndLegacy.isEmpty()) {
           bannerMessage.value =
-            prep.unsupportedJobs.firstOrNull()?.second
-              ?: "Original files cannot be modified in-place; tap Save Copy on each card."
+            prep.readOnlyOrFailedJobs.firstOrNull()?.second
+              ?: "Original files are read-only; tap Save Compressed Copy on each card."
           return@launch
         }
 
-        executeApprovedReplacements(actionable)
+        executeApprovedReplacements(directAndLegacy)
       } catch (t: Throwable) {
-        CompressionLogger.e("CompressXVM", "Failed preparing original replacement", t)
-        bannerMessage.value = "Replacement failed (originals preserved): ${CompressionLogger.formatUserErrorMessage(t)}"
+        CompressionLogger.e("CompressXVM", "Failed preparing batch original replacement", t)
+        bannerMessage.value =
+          "Replacement failed (originals preserved): ${CompressionLogger.formatUserErrorMessage(t)}"
       } finally {
         if (pendingSystemApproval.value == null) {
           isApplyingReplacements.value = false
@@ -302,22 +409,109 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
     }
   }
 
-  fun onSystemReplacementApprovalResult(granted: Boolean, jobIds: Set<String>) {
+  fun onSystemReplacementApprovalResult(
+    granted: Boolean,
+    request: PendingSystemApprovalRequest,
+  ) {
     pendingSystemApproval.value = null
-    if (!granted) {
-      isApplyingReplacements.value = false
-      bannerMessage.value = "Replacement cancelled — all original videos were preserved."
-      return
-    }
     viewModelScope.launch {
+      if (!granted) {
+        isApplyingReplacements.value = false
+        val deniedIds =
+          request.approvedJobIds + request.directSafJobIds + request.legacyJobIds
+        for (id in deniedIds) {
+          queueRepo.markAwaitingApprovalError(
+            id = id,
+            errorMessage =
+              "Batch deletion permission denied — original video preserved. Tap Save Copy or retry.",
+            replacementStatus = ReplacementPermissionStatus.DENIED,
+          )
+        }
+        bannerMessage.value =
+          "Batch permission denied — all original videos preserved."
+        return@launch
+      }
+
       isApplyingReplacements.value = true
       try {
-        val awaiting = withContext(Dispatchers.IO) { queueRepo.getAwaitingApprovalJobs() }
-        val approvedJobs = awaiting.filter { it.id in jobIds }
-        executeApprovedReplacements(approvedJobs)
+        val awaitingById =
+          withContext(Dispatchers.IO) { queueRepo.getAwaitingApprovalJobs().associateBy { it.id } }
+
+        var replacedCount = 0
+        var failedCount = 0
+        var freedBytes = 0L
+
+        if (request.kind == SystemApprovalKind.BATCH_MEDIASTORE_DELETE) {
+          for (jobId in request.approvedJobIds) {
+            val job = awaitingById[jobId] ?: continue
+            queueRepo.updateReplacementStatus(
+              job.id,
+              ReplacementPermissionStatus.BATCH_APPROVED,
+              null,
+            )
+            val outcome =
+              withContext(Dispatchers.IO) {
+                replacementManager.publishBatchApprovedOutput(job, request.snapshots[job.id])
+              }
+            when (outcome) {
+              is ReplacementOutcome.Replaced -> {
+                queueRepo.markCompleted(
+                  id = job.id,
+                  replacedOriginal = true,
+                  outputUri = outcome.outputUri.toString(),
+                  outputFileName = outcome.outputFileName,
+                  outputSizeBytes = outcome.outputSizeBytes,
+                  usedHardwareEncoder = job.usedHardwareEncoder ?: false,
+                  encoderName = job.encoderName ?: "MediaCodec",
+                  replacementStatus = ReplacementPermissionStatus.REPLACED,
+                )
+                replacedCount++
+                freedBytes += (job.originalSizeBytes - outcome.outputSizeBytes).coerceAtLeast(0L)
+              }
+              is ReplacementOutcome.Failed -> {
+                queueRepo.markAwaitingApprovalError(
+                  job.id,
+                  outcome.errorMessage,
+                  ReplacementPermissionStatus.FAILED,
+                )
+                failedCount++
+              }
+              is ReplacementOutcome.NeedsSystemIntentSender -> {
+                failedCount++
+              }
+            }
+          }
+
+          val remainingNonBatch =
+            (request.directSafJobIds + request.legacyJobIds).mapNotNull { awaitingById[it] }
+          if (remainingNonBatch.isNotEmpty()) {
+            val subResult = executeApprovedReplacements(remainingNonBatch, emitBanner = false)
+            replacedCount += subResult.replacedCount
+            failedCount += subResult.failedCount
+            freedBytes += subResult.freedBytes
+            if (subResult.pausedForIntentSender) {
+              return@launch
+            }
+          }
+
+          bannerMessage.value =
+            when {
+              replacedCount > 0 && failedCount == 0 ->
+                "Replaced $replacedCount original video${if (replacedCount == 1) "" else "s"} • Freed ${FormatUtils.formatBytes(freedBytes)}"
+              replacedCount > 0 && failedCount > 0 ->
+                "Replaced $replacedCount original(s); $failedCount could not be published"
+              failedCount > 0 ->
+                "Failed publishing $failedCount video(s); staged copies preserved."
+              else -> null
+            }
+        } else {
+          val approvedJobs = request.approvedJobIds.mapNotNull { awaitingById[it] }
+          executeApprovedReplacements(approvedJobs)
+        }
       } catch (t: Throwable) {
         CompressionLogger.e("CompressXVM", "Error executing approved replacements", t)
-        bannerMessage.value = "Replacement failed (originals preserved): ${CompressionLogger.formatUserErrorMessage(t)}"
+        bannerMessage.value =
+          "Replacement failed (originals preserved): ${CompressionLogger.formatUserErrorMessage(t)}"
       } finally {
         if (pendingSystemApproval.value == null) {
           isApplyingReplacements.value = false
@@ -326,7 +520,17 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
     }
   }
 
-  private suspend fun executeApprovedReplacements(jobs: List<VideoJobEntity>) {
+  private data class ExecutionBatchSummary(
+    val replacedCount: Int,
+    val failedCount: Int,
+    val freedBytes: Long,
+    val pausedForIntentSender: Boolean,
+  )
+
+  private suspend fun executeApprovedReplacements(
+    jobs: List<VideoJobEntity>,
+    emitBanner: Boolean = true,
+  ): ExecutionBatchSummary {
     var replacedCount = 0
     var failedCount = 0
     var savedBytes = 0L
@@ -343,37 +547,51 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
             outputSizeBytes = outcome.outputSizeBytes,
             usedHardwareEncoder = job.usedHardwareEncoder ?: false,
             encoderName = job.encoderName ?: "MediaCodec",
+            replacementStatus = ReplacementPermissionStatus.REPLACED,
           )
           replacedCount++
           savedBytes += (job.originalSizeBytes - outcome.outputSizeBytes).coerceAtLeast(0L)
         }
         is ReplacementOutcome.NeedsSystemIntentSender -> {
-          // Android 10 RecoverableSecurityException or individual write request -> prompt for remaining
+          // Android 10 RecoverableSecurityException fallback -> prompt for remaining
           val remainingIds = jobs.drop(idx).map { it.id }.toSet()
           pendingSystemApproval.value =
             PendingSystemApprovalRequest(
               intentSender = outcome.intentSender,
+              kind = SystemApprovalKind.LEGACY_SINGLE_WRITE,
               approvedJobIds = remainingIds,
             )
-          return
+          return ExecutionBatchSummary(replacedCount, failedCount, savedBytes, pausedForIntentSender = true)
         }
         is ReplacementOutcome.Failed -> {
-          queueRepo.markAwaitingApprovalError(job.id, outcome.errorMessage)
+          val isReadOnly =
+            replacementManager.assessEligibility(Uri.parse(job.sourceUri)).status ==
+              ReplacementPermissionStatus.READ_ONLY
+          queueRepo.markAwaitingApprovalError(
+            id = job.id,
+            errorMessage = outcome.errorMessage,
+            replacementStatus =
+              if (isReadOnly) ReplacementPermissionStatus.READ_ONLY
+              else ReplacementPermissionStatus.FAILED,
+          )
           failedCount++
         }
       }
     }
 
-    bannerMessage.value =
-      when {
-        replacedCount > 0 && failedCount == 0 ->
-          "Replaced $replacedCount original video${if (replacedCount == 1) "" else "s"} • Freed ${FormatUtils.formatBytes(savedBytes)}"
-        replacedCount > 0 && failedCount > 0 ->
-          "Replaced $replacedCount original(s); $failedCount preserved due to storage errors"
-        failedCount > 0 ->
-          "Replacement failed ($failedCount preserved intact). See card details or Save Copy."
-        else -> null
-      }
+    if (emitBanner) {
+      bannerMessage.value =
+        when {
+          replacedCount > 0 && failedCount == 0 ->
+            "Replaced $replacedCount original video${if (replacedCount == 1) "" else "s"} • Freed ${FormatUtils.formatBytes(savedBytes)}"
+          replacedCount > 0 && failedCount > 0 ->
+            "Replaced $replacedCount original(s); $failedCount preserved due to storage permissions"
+          failedCount > 0 ->
+            "Replacement failed ($failedCount preserved intact). See card details or Save Copy."
+          else -> null
+        }
+    }
+    return ExecutionBatchSummary(replacedCount, failedCount, savedBytes, pausedForIntentSender = false)
   }
 
   fun saveStagedJobAsCopy(jobId: String) {
@@ -394,11 +612,16 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           outputSizeBytes = saved.outputSizeBytes,
           usedHardwareEncoder = job.usedHardwareEncoder ?: false,
           encoderName = job.encoderName ?: "MediaCodec",
+          replacementStatus = ReplacementPermissionStatus.SAVED_COPY,
         )
         bannerMessage.value = "Saved copy as ${saved.outputFileName} (original preserved)"
       } catch (t: Throwable) {
         CompressionLogger.e("CompressXVM", "Failed saving staged copy for $jobId", t)
-        queueRepo.markAwaitingApprovalError(jobId, CompressionLogger.formatUserErrorMessage(t))
+        queueRepo.markAwaitingApprovalError(
+          id = jobId,
+          errorMessage = CompressionLogger.formatUserErrorMessage(t),
+          replacementStatus = ReplacementPermissionStatus.FAILED,
+        )
         bannerMessage.value = "Failed saving copy: ${CompressionLogger.formatUserErrorMessage(t)}"
       } finally {
         isApplyingReplacements.value = false
@@ -406,15 +629,29 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
     }
   }
 
+  fun saveAllReadOnlyAsCopies() {
+    saveAwaitingAsCopies(readOnlyOnly = true)
+  }
+
   fun saveAllStagedAsCopies() {
+    saveAwaitingAsCopies(readOnlyOnly = false)
+  }
+
+  private fun saveAwaitingAsCopies(readOnlyOnly: Boolean) {
     viewModelScope.launch {
       showBatchReplaceDialog.value = false
       isApplyingReplacements.value = true
       try {
         val config = prefsRepo.configFlow.first()
         val awaiting = withContext(Dispatchers.IO) { queueRepo.getAwaitingApprovalJobs() }
+        val targetJobs =
+          if (readOnlyOnly) {
+            awaiting.filter { it.replacementStatus == ReplacementPermissionStatus.READ_ONLY }
+          } else {
+            awaiting
+          }
         var savedCount = 0
-        for (job in awaiting) {
+        for (job in targetJobs) {
           runCatching {
             val saved =
               withContext(Dispatchers.IO) {
@@ -428,14 +665,24 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
               outputSizeBytes = saved.outputSizeBytes,
               usedHardwareEncoder = job.usedHardwareEncoder ?: false,
               encoderName = job.encoderName ?: "MediaCodec",
+              replacementStatus = ReplacementPermissionStatus.SAVED_COPY,
             )
             savedCount++
           }.onFailure {
-            queueRepo.markAwaitingApprovalError(job.id, CompressionLogger.formatUserErrorMessage(it))
+            queueRepo.markAwaitingApprovalError(
+              id = job.id,
+              errorMessage = CompressionLogger.formatUserErrorMessage(it),
+              replacementStatus = ReplacementPermissionStatus.FAILED,
+            )
           }
         }
         if (savedCount > 0) {
-          bannerMessage.value = "Saved $savedCount compressed copies (originals preserved)"
+          bannerMessage.value =
+            if (readOnlyOnly) {
+              "Saved $savedCount compressed copies from read-only sources (originals untouched)"
+            } else {
+              "Saved $savedCount compressed copies (originals preserved)"
+            }
         }
       } finally {
         isApplyingReplacements.value = false
@@ -492,7 +739,8 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
         }
       } catch (t: Throwable) {
         CompressionLogger.e("CompressXVM", "Failed receiving shared videos", t)
-        bannerMessage.value = "Failed receiving shared videos: ${CompressionLogger.formatUserErrorMessage(t)}"
+        bannerMessage.value =
+          "Failed receiving shared videos: ${CompressionLogger.formatUserErrorMessage(t)}"
       } finally {
         isImporting.value = false
       }
@@ -505,17 +753,15 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
 
   fun confirmShareReviewAndPrepareStart(onReadyToStart: () -> Unit) {
     viewModelScope.launch {
-      syncShareReviewJobsWithLatestConfig()
+      syncAllQueuedJobsWithLatestConfig()
       shareReviewState.value = null
       onReadyToStart()
     }
   }
 
-  private suspend fun syncShareReviewJobsWithLatestConfig() {
-    val activeShare = shareReviewState.value ?: return
-    if (activeShare.jobIds.isEmpty()) return
+  private suspend fun syncAllQueuedJobsWithLatestConfig() {
     val updatedConfig = prefsRepo.configFlow.first()
-    queueRepo.applyConfigToQueuedJobs(activeShare.jobIds, updatedConfig)
+    queueRepo.applyConfigToAllQueuedJobs(updatedConfig)
   }
 
   fun onVideosSelected(uris: List<Uri>) {
@@ -532,8 +778,12 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           )
         val addedCount = result.addedJobs.size
         val skipped = result.skippedDuplicateCount
+        val readOnlyAdded =
+          result.addedJobs.count { it.replacementStatus == ReplacementPermissionStatus.READ_ONLY }
         bannerMessage.value =
           when {
+            addedCount > 0 && readOnlyAdded > 0 ->
+              "Added $addedCount video${if (addedCount == 1) "" else "s"} ($readOnlyAdded read-only source${if (readOnlyAdded == 1) "" else "s"} will save as copy)"
             addedCount > 0 && skipped > 0 ->
               "Added $addedCount video${if (addedCount == 1) "" else "s"} ($skipped duplicate${if (skipped == 1) "" else "s"} skipped)"
             addedCount > 0 ->
@@ -544,7 +794,8 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           }
       } catch (t: Throwable) {
         CompressionLogger.e("CompressXVM", "Failed to import selected videos", t)
-        bannerMessage.value = "Failed to import selected videos: ${CompressionLogger.formatUserErrorMessage(t)}"
+        bannerMessage.value =
+          "Failed to import selected videos: ${CompressionLogger.formatUserErrorMessage(t)}"
       } finally {
         isImporting.value = false
       }
@@ -666,7 +917,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
   fun selectPreset(preset: CompressionPreset) {
     viewModelScope.launch {
       prefsRepo.updatePreset(preset)
-      syncShareReviewJobsWithLatestConfig()
+      syncAllQueuedJobsWithLatestConfig()
     }
   }
 
@@ -676,14 +927,14 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       if (uiState.value.config.preset != CompressionPreset.CUSTOM) {
         prefsRepo.updatePreset(CompressionPreset.CUSTOM)
       }
-      syncShareReviewJobsWithLatestConfig()
+      syncAllQueuedJobsWithLatestConfig()
     }
   }
 
   fun selectCodec(codec: VideoCodec) {
     viewModelScope.launch {
       prefsRepo.updateCodec(codec)
-      syncShareReviewJobsWithLatestConfig()
+      syncAllQueuedJobsWithLatestConfig()
     }
   }
 
@@ -693,7 +944,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       if (uiState.value.config.preset != CompressionPreset.CUSTOM) {
         prefsRepo.updatePreset(CompressionPreset.CUSTOM)
       }
-      syncShareReviewJobsWithLatestConfig()
+      syncAllQueuedJobsWithLatestConfig()
     }
   }
 
