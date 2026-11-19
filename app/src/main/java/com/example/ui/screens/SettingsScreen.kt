@@ -82,6 +82,8 @@ fun SettingsScreen(
   onToggleThermalProtection: (Boolean) -> Unit,
   onTogglePauseLowBattery: (Boolean) -> Unit,
   onToggleAutoResume: (Boolean) -> Unit,
+  isBatteryUnrestricted: Boolean = false,
+  onOpenBatterySettings: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val config = uiState.config
@@ -443,6 +445,40 @@ fun SettingsScreen(
               onCheckedChange = onToggleAutoResume,
               testTag = "toggle_auto_resume",
             )
+            Row(
+              modifier =
+                Modifier
+                  .fillMaxWidth()
+                  .clip(RoundedCornerShape(12.dp))
+                  .clickable(onClick = onOpenBatterySettings)
+                  .padding(vertical = 6.dp)
+                  .testTag("battery_optimization_settings_row"),
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+              Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                Text(
+                  text = "Background Battery Execution",
+                  style = MaterialTheme.typography.bodyLarge,
+                  color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                  text =
+                    if (isBatteryUnrestricted) {
+                      "Unrestricted — screen-off batches protected from OEM sleep"
+                    } else {
+                      "Recommended: set CompressX Studio to Unrestricted in Android battery settings"
+                    },
+                  style = MaterialTheme.typography.bodyMedium,
+                  color = if (isBatteryUnrestricted) EmeraldSuccess else AmberWarning,
+                )
+              }
+              Text(
+                text = if (isBatteryUnrestricted) "Active" else "Configure",
+                style = MaterialTheme.typography.labelLarge,
+                color = if (isBatteryUnrestricted) EmeraldSuccess else CyanPrimary,
+              )
+            }
           }
         }
       }

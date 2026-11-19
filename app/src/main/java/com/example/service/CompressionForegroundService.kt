@@ -28,6 +28,8 @@ class CompressionForegroundService : Service() {
     const val ACTION_START_OR_RESUME = "com.example.action.START_OR_RESUME"
     const val ACTION_PAUSE = "com.example.action.PAUSE"
     const val ACTION_CANCEL_ACTIVE = "com.example.action.CANCEL_ACTIVE"
+    const val ACTION_CANCEL_JOB = "com.example.action.CANCEL_JOB"
+    const val EXTRA_JOB_ID = "com.example.extra.JOB_ID"
     private const val WAKELOCK_TAG = "CompressXStudio::BatchEncodingWakeLock"
     private const val MAX_WAKELOCK_MS = 6 * 60 * 60 * 1000L // 6-hour safety cap
 
@@ -67,11 +69,29 @@ class CompressionForegroundService : Service() {
         .onFailure { CompressionLogger.w(TAG, "pauseQueue startService failed safely", it) }
     }
 
+    fun cancelSpecificJob(context: Context, jobId: String) {
+      val app = context.applicationContext as? CompressXApplication
+      app?.batchQueueRunner?.cancelSpecificJob(jobId)
+      if (!isRunning) return
+
+      val intent =
+        Intent(context, CompressionForegroundService::class.java).apply {
+          action = ACTION_CANCEL_JOB
+          putExtra(EXTRA_JOB_ID, jobId)
+        }
+      runCatching { context.startService(intent) }
+        .onFailure { CompressionLogger.w(TAG, "cancelSpecificJob startService failed safely", it) }
+    }
+
     fun cancelActiveJob(context: Context) {
       val app = context.applicationContext as? CompressXApplication
       val activeId = app?.batchQueueRunner?.activeJobId
       if (!isRunning) {
-        app?.compressionEngine?.cancelActive()
+        if (activeId != null) {
+          app.batchQueueRunner.cancelSpecificJob(activeId)
+        } else {
+          app?.compressionEngine?.cancelActive()
+        }
         return
       }
 
@@ -107,12 +127,21 @@ class CompressionForegroundService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     isRunning = true
-    when (intent?.action) {
+    return when (intent?.action) {
       ACTION_PAUSE -> {
-        handlePause()
+        handlePause(reason = null)
+        START_NOT_STICKY
       }
       ACTION_CANCEL_ACTIVE -> {
         handleCancelActive()
+        if (workerJob?.isActive == true) START_STICKY else START_NOT_STICKY
+      }
+      ACTION_CANCEL_JOB -> {
+        val targetJobId = intent.getStringExtra(EXTRA_JOB_ID)
+        if (!targetJobId.isNullOrBlank()) {
+          handleCancelSpecificJob(targetJobId)
+        }
+        if (workerJob?.isActive == true) START_STICKY else START_NOT_STICKY
       }
       ACTION_START_OR_RESUME, null -> {
         val app = application as CompressXApplication
@@ -128,14 +157,15 @@ class CompressionForegroundService : Service() {
           return START_NOT_STICKY
         }
         ensureWorkerRunning()
+        START_STICKY
       }
+      else -> START_NOT_STICKY
     }
-    return START_NOT_STICKY
   }
 
   override fun onTimeout(startId: Int) {
     CompressionLogger.w(TAG, "Foreground service timeout reached (API 34+); pausing cleanly")
-    handlePause()
+    handlePause(reason = "Android paused long background session. Tap to resume remaining videos.")
   }
 
   override fun onTimeout(startId: Int, fgsType: Int) {
@@ -143,7 +173,7 @@ class CompressionForegroundService : Service() {
       TAG,
       "Foreground service mediaProcessing timeout reached (type=$fgsType); pausing cleanly",
     )
-    handlePause()
+    handlePause(reason = "Android paused long background session. Tap to resume remaining videos.")
   }
 
   override fun onDestroy() {
@@ -258,7 +288,14 @@ class CompressionForegroundService : Service() {
               },
             )
 
-          if (
+          if (summary.wasPaused && !summary.pauseReason.isNullOrBlank()) {
+            val remaining = runCatching { app.queueRepository.countPendingOrPaused() }.getOrDefault(0)
+            NotificationHelper.postRecoveryNotification(
+              context = this@CompressionForegroundService,
+              pendingCount = remaining,
+              reason = summary.pauseReason,
+            )
+          } else if (
             !summary.wasPaused &&
               (summary.completedCount > 0 || summary.awaitingApprovalCount > 0 || summary.failedCount > 0)
           ) {
@@ -281,16 +318,36 @@ class CompressionForegroundService : Service() {
       }
   }
 
-  private fun handlePause() {
+  private fun handlePause(reason: String?) {
     val app = application as CompressXApplication
     app.batchQueueRunner.requestPause()
     serviceScope.launch {
       runCatching { app.queueRepository.pauseActiveProcessingJobs() }
         .onFailure { CompressionLogger.e(TAG, "Failed pausing active jobs in DB", it) }
+      if (!reason.isNullOrBlank()) {
+        val remaining = runCatching { app.queueRepository.countPendingOrPaused() }.getOrDefault(0)
+        NotificationHelper.postRecoveryNotification(
+          context = this@CompressionForegroundService,
+          pendingCount = remaining,
+          reason = reason,
+        )
+      }
       workerJob?.cancel()
       stopForegroundSafely()
       isRunning = false
       stopSelf()
+    }
+  }
+
+  private fun handleCancelSpecificJob(targetId: String) {
+    val app = application as CompressXApplication
+    app.batchQueueRunner.cancelSpecificJob(targetId)
+    serviceScope.launch {
+      if (workerJob?.isActive != true) {
+        stopForegroundSafely()
+        isRunning = false
+        stopSelf()
+      }
     }
   }
 
@@ -301,8 +358,10 @@ class CompressionForegroundService : Service() {
       if (targetId != null) {
         runCatching { app.queueRepository.cancelJob(targetId) }
           .onFailure { CompressionLogger.e(TAG, "Failed cancelling job $targetId", it) }
+        app.batchQueueRunner.cancelSpecificJob(targetId)
+      } else {
+        app.compressionEngine.cancelActive()
       }
-      app.compressionEngine.cancelActive()
       if (workerJob?.isActive != true) {
         stopForegroundSafely()
         isRunning = false

@@ -23,6 +23,7 @@ object NotificationHelper {
   const val CHANNEL_COMPLETE = "compressx_complete_channel"
   const val PROGRESS_NOTIFICATION_ID = 1001
   const val COMPLETE_NOTIFICATION_ID = 1002
+  const val RECOVERY_NOTIFICATION_ID = 1003
 
   fun ensureChannels(context: Context) {
     runCatching {
@@ -105,21 +106,36 @@ object NotificationHelper {
       )
 
     val safeTotal = totalCount.coerceAtLeast(1)
+    val safeCompleted = completedCount.coerceIn(0, safeTotal)
+    val remaining = (safeTotal - safeCompleted).coerceAtLeast(0)
     val clampedProgress = jobProgress.coerceIn(0, 100)
+    val overallPercent =
+      (((safeCompleted * 100.0) + clampedProgress) / safeTotal.toDouble()).toInt().coerceIn(0, 100)
+
     val title =
       if (safeTotal > 1) {
-        "Compressing (${(completedCount + 1).coerceAtMost(safeTotal)}/$safeTotal) • $clampedProgress%"
+        "Compressing $fileName • $clampedProgress%"
       } else {
-        "Compressing • $clampedProgress%"
+        "Compressing $fileName • $clampedProgress%"
       }
 
-    val content = statusNote ?: fileName
+    val batchSummary =
+      "Completed: $safeCompleted • Remaining: $remaining • Overall: $overallPercent%"
+    val content = statusNote ?: batchSummary
+    val expandedText =
+      if (statusNote != null) {
+        "$statusNote\n$batchSummary"
+      } else {
+        "File: $fileName ($clampedProgress%)\n$batchSummary"
+      }
 
     return NotificationCompat.Builder(context, CHANNEL_PROGRESS)
       .setSmallIcon(android.R.drawable.stat_sys_download)
       .setContentTitle(title)
       .setContentText(content)
-      .setProgress(100, clampedProgress, false)
+      .setSubText("Overall $overallPercent%")
+      .setStyle(NotificationCompat.BigTextStyle().bigText(expandedText))
+      .setProgress(100, overallPercent, false)
       .setOngoing(true)
       .setOnlyAlertOnce(true)
       .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -178,5 +194,38 @@ object NotificationHelper {
 
     runCatching { NotificationManagerCompat.from(context).notify(COMPLETE_NOTIFICATION_ID, notification) }
       .onFailure { CompressionLogger.w(TAG, "Failed posting completion notification", it) }
+  }
+
+  fun postRecoveryNotification(
+    context: Context,
+    pendingCount: Int,
+    reason: String = "Compression queue was safely preserved. Tap to resume.",
+  ) {
+    if (pendingCount <= 0 || !canPostNotifications(context)) return
+    ensureChannels(context)
+
+    val openIntent =
+      PendingIntent.getActivity(
+        context,
+        11,
+        Intent(context, MainActivity::class.java).apply {
+          flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        },
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+      )
+
+    val title = "Resume $pendingCount queued video${if (pendingCount == 1) "" else "s"}"
+    val notification =
+      NotificationCompat.Builder(context, CHANNEL_COMPLETE)
+        .setSmallIcon(android.R.drawable.stat_sys_download_done)
+        .setContentTitle(title)
+        .setContentText(reason)
+        .setAutoCancel(true)
+        .setContentIntent(openIntent)
+        .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+        .build()
+
+    runCatching { NotificationManagerCompat.from(context).notify(RECOVERY_NOTIFICATION_ID, notification) }
+      .onFailure { CompressionLogger.w(TAG, "Failed posting recovery notification", it) }
   }
 }

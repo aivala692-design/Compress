@@ -144,6 +144,7 @@ data class BatchSummaryStats(
   val completedCount: Int = 0,
   val replacedCount: Int = 0,
   val failedCount: Int = 0,
+  val needsRelinkCount: Int = 0,
   val replaceEligibleCount: Int = 0,
   val readOnlyCount: Int = 0,
   val totalOriginalBytesCompleted: Long = 0L,

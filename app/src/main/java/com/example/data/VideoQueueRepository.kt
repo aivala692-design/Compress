@@ -9,6 +9,8 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.example.engine.CompressionLogger
 import com.example.engine.CompressionPlanCalculator
+import com.example.engine.EligibilityAssessment
+import com.example.engine.FileFingerprintUtil
 import com.example.engine.MediaReplacementManager
 import com.example.engine.OutputStorageWriter
 import com.example.model.BatchSummaryStats
@@ -30,7 +32,25 @@ import kotlinx.coroutines.withContext
 data class EnqueueBatchResult(
   val addedJobs: List<VideoJobEntity>,
   val skippedDuplicateCount: Int,
+  val skippedActiveCount: Int = 0,
+  val skippedCompletedCount: Int = 0,
+  val skippedInBatchCount: Int = 0,
 )
+
+data class RetryFailedResult(
+  val retriedCount: Int,
+  val needsRelinkRemainingCount: Int,
+)
+
+sealed interface RelinkResult {
+  data class Success(val job: VideoJobEntity) : RelinkResult
+
+  data class DuplicateConflict(val message: String) : RelinkResult
+
+  data class InvalidFile(val message: String) : RelinkResult
+
+  data object NotFound : RelinkResult
+}
 
 class VideoQueueRepository(
   private val context: Context,
@@ -56,61 +76,138 @@ class VideoQueueRepository(
     withContext(Dispatchers.IO) {
       if (uris.isEmpty()) return@withContext EnqueueBatchResult(emptyList(), 0)
 
-      val activeUriSet =
-        if (deduplicateActive) dao.getActiveSourceUris().toHashSet() else hashSetOf()
-      val seenInBatch = hashSetOf<String>()
-      val uniqueUris = mutableListOf<Uri>()
-      var duplicateCount = 0
+      val existingEntries =
+        if (deduplicateActive) dao.getDeduplicationEntries() else emptyList()
+      val existingActiveUris = hashSetOf<String>()
+      val existingCompletedUris = hashSetOf<String>()
+      val existingActiveFingerprints = hashSetOf<String>()
+      val existingCompletedFingerprints = hashSetOf<String>()
 
+      for (entry in existingEntries) {
+        if (entry.status == JobStatus.COMPLETED) {
+          existingCompletedUris += entry.sourceUri
+          entry.contentFingerprint?.let { existingCompletedFingerprints += it }
+        } else {
+          existingActiveUris += entry.sourceUri
+          entry.contentFingerprint?.let { existingActiveFingerprints += it }
+        }
+      }
+
+      val seenBatchUris = hashSetOf<String>()
+      val candidateUris = mutableListOf<Uri>()
+      var skippedActiveCount = 0
+      var skippedCompletedCount = 0
+      var skippedInBatchCount = 0
+
+      // Fast first-pass URI deduplication before disk probing
       for (uri in uris) {
         val uriKey = uri.toString()
-        if (!seenInBatch.add(uriKey) || (deduplicateActive && uriKey in activeUriSet)) {
-          duplicateCount++
+        if (!seenBatchUris.add(uriKey)) {
+          skippedInBatchCount++
           continue
         }
-        uniqueUris += uri
+        if (deduplicateActive) {
+          if (uriKey in existingActiveUris) {
+            skippedActiveCount++
+            continue
+          }
+          if (uriKey in existingCompletedUris) {
+            skippedCompletedCount++
+            continue
+          }
+        }
+        candidateUris += uri
       }
 
-      if (uniqueUris.isEmpty()) {
-        return@withContext EnqueueBatchResult(emptyList(), duplicateCount)
+      if (candidateUris.isEmpty()) {
+        val totalSkipped = skippedActiveCount + skippedCompletedCount + skippedInBatchCount
+        return@withContext EnqueueBatchResult(
+          addedJobs = emptyList(),
+          skippedDuplicateCount = totalSkipped,
+          skippedActiveCount = skippedActiveCount,
+          skippedCompletedCount = skippedCompletedCount,
+          skippedInBatchCount = skippedInBatchCount,
+        )
       }
 
-      // Bounded parallel metadata probing via ContentResolver so 50+ shared videos load quickly
+      // Bounded parallel metadata + content fingerprint probing via ContentResolver
       val semaphore = Semaphore(4)
       val probedResults =
         coroutineScope {
-          uniqueUris
+          candidateUris
             .map { uri ->
               async(Dispatchers.IO) {
                 semaphore.withPermit {
-                  // Persistable permission works for SAF documents and providers that offer persistable grants
-                  runCatching {
-                    context.contentResolver.takePersistableUriPermission(
-                      uri,
-                      Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-                    )
-                  }.onFailure {
-                    runCatching {
-                      context.contentResolver.takePersistableUriPermission(
-                        uri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                      )
-                    }
-                  }
+                  val hasPersistable = tryTakePersistablePermission(uri)
                   val eligibility = mediaReplacementManager.assessEligibility(uri)
-                  Triple(uri, probeVideoMetadata(uri), eligibility)
+                  val probed = probeVideoMetadata(uri)
+                  val fingerprint =
+                    FileFingerprintUtil.computeContentFingerprint(
+                      context = context,
+                      uri = uri,
+                      sizeBytes = probed.sizeBytes,
+                      durationMs = probed.durationMs,
+                      width = probed.width,
+                      height = probed.height,
+                    )
+                  ProbedCandidate(
+                    uri = uri,
+                    probed = probed,
+                    eligibility = eligibility,
+                    fingerprint = fingerprint,
+                    hasPersistablePermission = hasPersistable,
+                  )
                 }
               }
             }
             .awaitAll()
         }
 
+      // Second-pass content-fingerprint deduplication catches identical videos picked via
+      // different URIs (Photo Picker vs SAF vs MediaStore vs Share Sheet) AND within the batch
+      val seenBatchFingerprints = hashSetOf<String>()
+      val acceptedCandidates = mutableListOf<ProbedCandidate>()
+
+      for (candidate in probedResults) {
+        val fp = candidate.fingerprint
+        if (fp != null) {
+          if (!seenBatchFingerprints.add(fp)) {
+            skippedInBatchCount++
+            continue
+          }
+          if (deduplicateActive) {
+            if (fp in existingActiveFingerprints) {
+              skippedActiveCount++
+              continue
+            }
+            if (fp in existingCompletedFingerprints) {
+              skippedCompletedCount++
+              continue
+            }
+          }
+        }
+        acceptedCandidates += candidate
+      }
+
+      val totalSkipped = skippedActiveCount + skippedCompletedCount + skippedInBatchCount
+      if (acceptedCandidates.isEmpty()) {
+        return@withContext EnqueueBatchResult(
+          addedJobs = emptyList(),
+          skippedDuplicateCount = totalSkipped,
+          skippedActiveCount = skippedActiveCount,
+          skippedCompletedCount = skippedCompletedCount,
+          skippedInBatchCount = skippedInBatchCount,
+        )
+      }
+
       var nextSort = dao.getMaxSortOrder() + 1
       val effectiveMode =
         if (config.isReplaceOriginalActive) OutputMode.REPLACE_ORIGINAL else OutputMode.KEEP_ORIGINAL
 
       val jobs =
-        probedResults.map { (uri, probed, eligibility) ->
+        acceptedCandidates.map { candidate ->
+          val probed = candidate.probed
+          val eligibility = candidate.eligibility
           val initialPermissionStatus =
             if (!probed.isValid) {
               ReplacementPermissionStatus.FAILED
@@ -119,7 +216,7 @@ class VideoQueueRepository(
             }
           VideoJobEntity(
             id = UUID.randomUUID().toString(),
-            sourceUri = uri.toString(),
+            sourceUri = candidate.uri.toString(),
             fileName = probed.fileName,
             durationMs = probed.durationMs,
             originalSizeBytes = probed.sizeBytes,
@@ -141,13 +238,122 @@ class VideoQueueRepository(
             sourceAuthority = eligibility.authority,
             sourceRelativePath = eligibility.mediaStoreMeta?.relativePath,
             sourceDateTakenMs = eligibility.mediaStoreMeta?.dateTakenMs,
+            contentFingerprint = candidate.fingerprint,
+            needsRelink = probed.isPermissionError,
+            hasPersistablePermission = candidate.hasPersistablePermission,
             errorMessage = probed.errorMessage,
           )
         }
 
       jobs.chunked(50).forEach { chunk -> dao.insertJobs(chunk) }
-      EnqueueBatchResult(addedJobs = jobs, skippedDuplicateCount = duplicateCount)
+      EnqueueBatchResult(
+        addedJobs = jobs,
+        skippedDuplicateCount = totalSkipped,
+        skippedActiveCount = skippedActiveCount,
+        skippedCompletedCount = skippedCompletedCount,
+        skippedInBatchCount = skippedInBatchCount,
+      )
     }
+
+  suspend fun relinkJob(jobId: String, newUri: Uri): RelinkResult =
+    withContext(Dispatchers.IO) {
+      val existing = dao.getJobById(jobId) ?: return@withContext RelinkResult.NotFound
+      val hasPersistable = tryTakePersistablePermission(newUri)
+      val probed = probeVideoMetadata(newUri)
+      if (!probed.isValid) {
+        return@withContext RelinkResult.InvalidFile(
+          probed.errorMessage ?: "Selected file is not a readable video."
+        )
+      }
+
+      val fingerprint =
+        FileFingerprintUtil.computeContentFingerprint(
+          context = context,
+          uri = newUri,
+          sizeBytes = probed.sizeBytes,
+          durationMs = probed.durationMs,
+          width = probed.width,
+          height = probed.height,
+        )
+
+      // Prevent relinking to a video that is already queued/processing/completed under another job
+      val otherEntries = dao.getDeduplicationEntries().filter { it.id != jobId }
+      val newUriStr = newUri.toString()
+      val conflict =
+        otherEntries.firstOrNull { entry ->
+          entry.sourceUri == newUriStr ||
+            (fingerprint != null && entry.contentFingerprint == fingerprint)
+        }
+      if (conflict != null) {
+        val reason =
+          if (conflict.status == JobStatus.COMPLETED) {
+            "That video has already been compressed."
+          } else {
+            "That video is already in the active queue."
+          }
+        return@withContext RelinkResult.DuplicateConflict(reason)
+      }
+
+      val eligibility = mediaReplacementManager.assessEligibility(newUri)
+      deleteTempFilesForJob(existing)
+
+      dao.relinkJobSource(
+        id = jobId,
+        sourceUri = newUriStr,
+        fileName = probed.fileName,
+        durationMs = probed.durationMs,
+        originalSizeBytes = probed.sizeBytes,
+        width = probed.width,
+        height = probed.height,
+        rotation = probed.rotation,
+        sourceBitrateBps = probed.bitrateBps,
+        sourceFrameRate = probed.frameRate,
+        sourceAudioBitrateBps = probed.audioBitrateBps,
+        contentFingerprint = fingerprint,
+        hasPersistablePermission = hasPersistable,
+        replacementStatus = eligibility.status,
+        sourceAuthority = eligibility.authority,
+        sourceRelativePath = eligibility.mediaStoreMeta?.relativePath,
+        sourceDateTakenMs = eligibility.mediaStoreMeta?.dateTakenMs,
+      )
+
+      val updated = dao.getJobById(jobId) ?: return@withContext RelinkResult.NotFound
+      CompressionLogger.i("CompressXRepo", "Relinked job $jobId to ${updated.fileName}")
+      RelinkResult.Success(updated)
+    }
+
+  fun isUriReadable(uri: Uri): Boolean {
+    return try {
+      context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { true }
+        ?: context.contentResolver.openInputStream(uri)?.use { true }
+        ?: false
+    } catch (_: Throwable) {
+      false
+    }
+  }
+
+  private fun tryTakePersistablePermission(uri: Uri): Boolean {
+    val taken =
+      runCatching {
+        context.contentResolver.takePersistableUriPermission(
+          uri,
+          Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+        )
+        true
+      }.getOrElse {
+        runCatching {
+          context.contentResolver.takePersistableUriPermission(
+            uri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+          )
+          true
+        }.getOrDefault(false)
+      }
+    if (taken) return true
+    return runCatching {
+      context.contentResolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
+    }.getOrDefault(false)
+  }
 
   suspend fun applyConfigToQueuedJobs(
     jobIds: List<String>,
@@ -189,6 +395,10 @@ class VideoQueueRepository(
   suspend fun getJobById(id: String): VideoJobEntity? = dao.getJobById(id)
 
   suspend fun countPendingOrActive(): Int = dao.countPendingOrActive()
+
+  suspend fun countPendingOrPaused(): Int = dao.countPendingOrPaused()
+
+  suspend fun countCompleted(): Int = dao.countCompleted()
 
   suspend fun updateStatusAndProgress(id: String, status: JobStatus, progress: Int) =
     dao.updateStatusAndProgress(id, status, progress)
@@ -249,57 +459,115 @@ class VideoQueueRepository(
       completedAt = System.currentTimeMillis(),
     )
 
-  suspend fun markFailed(id: String, errorMessage: String) {
-    val existing = dao.getJobById(id)
-    existing?.stagedTempPath?.let { path ->
+  suspend fun markFailed(
+    id: String,
+    errorMessage: String,
+    needsRelink: Boolean = false,
+  ) =
+    withContext(Dispatchers.IO) {
+      val existing = dao.getJobById(id) ?: return@withContext
+      deleteTempFilesForJob(existing)
+      dao.markFailed(
+        id = id,
+        errorMessage = errorMessage,
+        needsRelink = needsRelink,
+        completedAt = System.currentTimeMillis(),
+      )
+    }
+
+  suspend fun reorderJobs(orderedIds: List<String>) =
+    withContext(Dispatchers.IO) { dao.reorderJobs(orderedIds) }
+
+  suspend fun resetInterruptedProcessingJobs() =
+    withContext(Dispatchers.IO) { dao.resetInterruptedProcessingJobs() }
+
+  suspend fun resumeAllPausedJobs() =
+    withContext(Dispatchers.IO) { dao.resumeAllPausedJobs() }
+
+  suspend fun pauseActiveProcessingJobs() =
+    withContext(Dispatchers.IO) { dao.pauseActiveProcessingJobs() }
+
+  suspend fun pauseAllPendingAndProcessingJobs() =
+    withContext(Dispatchers.IO) { dao.pauseAllPendingAndProcessingJobs() }
+
+  /**
+   * Retries ONLY FAILED jobs (never COMPLETED or CANCELLED).
+   * Jobs marked needsRelink are re-tested first: if their URI is readable again, they are retried;
+   * otherwise they stay clearly flagged for one-tap Relink instead of immediately failing again.
+   */
+  suspend fun retryAllFailedJobs(): RetryFailedResult =
+    withContext(Dispatchers.IO) {
+      val failedJobs = dao.getFailedJobs()
+      var needsRelinkRemaining = 0
+      for (job in failedJobs) {
+        deleteTempFilesForJob(job)
+        if (job.needsRelink) {
+          val readable = runCatching { isUriReadable(Uri.parse(job.sourceUri)) }.getOrDefault(false)
+          if (readable) {
+            dao.clearNeedsRelink(job.id)
+          } else {
+            needsRelinkRemaining++
+          }
+        }
+      }
+      val retried = dao.retryAllFailedJobs()
+      RetryFailedResult(
+        retriedCount = retried,
+        needsRelinkRemainingCount = needsRelinkRemaining,
+      )
+    }
+
+  suspend fun retryJob(id: String): Boolean =
+    withContext(Dispatchers.IO) {
+      val existing = dao.getJobById(id) ?: return@withContext false
+      if (existing.status != JobStatus.FAILED && existing.status != JobStatus.CANCELLED) {
+        return@withContext false
+      }
+      deleteTempFilesForJob(existing)
+      dao.retryJob(id) > 0
+    }
+
+  suspend fun cancelJob(id: String) =
+    withContext(Dispatchers.IO) {
+      val existing = dao.getJobById(id) ?: return@withContext
+      deleteTempFilesForJob(existing)
+      dao.updateStatusAndProgress(id, JobStatus.CANCELLED, 0)
+    }
+
+  suspend fun deleteJob(id: String) =
+    withContext(Dispatchers.IO) {
+      val existing = runCatching { dao.getJobById(id) }.getOrNull()
+      if (existing != null) {
+        deleteTempFilesForJob(existing)
+      }
+      runCatching { dao.deleteJob(id) }
+        .onFailure { CompressionLogger.e("CompressXRepo", "Failed to delete job $id", it) }
+    }
+
+  suspend fun clearCompletedAndCancelled() =
+    withContext(Dispatchers.IO) { dao.clearCompletedAndCancelled() }
+
+  suspend fun clearAllNonProcessing() =
+    withContext(Dispatchers.IO) {
+      dao.getAwaitingApprovalJobs().forEach { job -> deleteTempFilesForJob(job) }
+      dao.clearAllNonProcessing()
+    }
+
+  suspend fun clearAll() =
+    withContext(Dispatchers.IO) {
+      dao.getAwaitingApprovalJobs().forEach { job -> deleteTempFilesForJob(job) }
+      dao.clearAllJobs()
+    }
+
+  private fun deleteTempFilesForJob(job: VideoJobEntity) {
+    job.stagedTempPath?.let { path ->
       runCatching { File(path).delete() }
         .onFailure { CompressionLogger.w("CompressXRepo", "Cleanup of staged file failed", it) }
     }
-    dao.markFailed(id, errorMessage, System.currentTimeMillis())
-  }
-
-  suspend fun reorderJobs(orderedIds: List<String>) = dao.reorderJobs(orderedIds)
-
-  suspend fun resetInterruptedProcessingJobs() = dao.resetInterruptedProcessingJobs()
-
-  suspend fun resumeAllPausedJobs() = dao.resumeAllPausedJobs()
-
-  suspend fun pauseActiveProcessingJobs() = dao.pauseActiveProcessingJobs()
-
-  suspend fun retryAllFailedJobs() = dao.retryAllFailedJobs()
-
-  suspend fun retryJob(id: String) = dao.retryJob(id)
-
-  suspend fun cancelJob(id: String) {
-    val existing = dao.getJobById(id)
-    existing?.stagedTempPath?.let { path ->
-      runCatching { File(path).delete() }
+    runCatching {
+      val workTmp = File(File(context.cacheDir, "compressx_work"), "${job.id}.tmp.mp4")
+      if (workTmp.exists()) workTmp.delete()
     }
-    dao.updateStatusAndProgress(id, JobStatus.CANCELLED, 0)
-  }
-
-  suspend fun deleteJob(id: String) {
-    val existing = dao.getJobById(id)
-    existing?.stagedTempPath?.let { path ->
-      runCatching { File(path).delete() }
-    }
-    dao.deleteJob(id)
-  }
-
-  suspend fun clearCompletedAndCancelled() = dao.clearCompletedAndCancelled()
-
-  suspend fun clearAllNonProcessing() {
-    dao.getAwaitingApprovalJobs().forEach { job ->
-      job.stagedTempPath?.let { path -> runCatching { File(path).delete() } }
-    }
-    dao.clearAllNonProcessing()
-  }
-
-  suspend fun clearAll() {
-    dao.getAwaitingApprovalJobs().forEach { job ->
-      job.stagedTempPath?.let { path -> runCatching { File(path).delete() } }
-    }
-    dao.clearAllJobs()
   }
 
   fun computeStats(
@@ -314,6 +582,7 @@ class VideoQueueRepository(
     var completed = 0
     var replaced = 0
     var failed = 0
+    var needsRelink = 0
     var replaceEligible = 0
     var readOnly = 0
     var originalCompleted = 0L
@@ -325,6 +594,10 @@ class VideoQueueRepository(
     var activeProgressSum = 0
 
     for (job in jobs) {
+      if (job.needsRelink && job.status == JobStatus.FAILED) {
+        needsRelink++
+      }
+
       when (job.replacementStatus) {
         ReplacementPermissionStatus.ELIGIBLE,
         ReplacementPermissionStatus.PENDING_BATCH_APPROVAL,
@@ -440,10 +713,14 @@ class VideoQueueRepository(
     val minSavedPending = (originalPending - estMaxOutPending).coerceAtLeast(0L)
     val maxSavedPending = (originalPending - estMinOutPending).coerceAtLeast(0L)
     val minPctPending =
-      if (originalPending > 0L) ((minSavedPending.toDouble() / originalPending.toDouble()) * 100.0).toInt().coerceIn(0, 99)
+      if (originalPending > 0L)
+        ((minSavedPending.toDouble() / originalPending.toDouble()) * 100.0).toInt().coerceIn(0, 99)
       else 0
     val maxPctPending =
-      if (originalPending > 0L) ((maxSavedPending.toDouble() / originalPending.toDouble()) * 100.0).toInt().coerceIn(minPctPending, 99)
+      if (originalPending > 0L)
+        ((maxSavedPending.toDouble() / originalPending.toDouble()) * 100.0)
+          .toInt()
+          .coerceIn(minPctPending, 99)
       else 0
 
     return BatchSummaryStats(
@@ -454,6 +731,7 @@ class VideoQueueRepository(
       completedCount = completed,
       replacedCount = replaced,
       failedCount = failed,
+      needsRelinkCount = needsRelink,
       replaceEligibleCount = replaceEligible,
       readOnlyCount = readOnly,
       totalOriginalBytesCompleted = originalCompleted,
@@ -470,6 +748,14 @@ class VideoQueueRepository(
     )
   }
 
+  private data class ProbedCandidate(
+    val uri: Uri,
+    val probed: ProbedVideoInfo,
+    val eligibility: EligibilityAssessment,
+    val fingerprint: String?,
+    val hasPersistablePermission: Boolean,
+  )
+
   private data class ProbedVideoInfo(
     val fileName: String,
     val sizeBytes: Long,
@@ -481,6 +767,7 @@ class VideoQueueRepository(
     val frameRate: Float,
     val audioBitrateBps: Int,
     val isValid: Boolean,
+    val isPermissionError: Boolean,
     val errorMessage: String?,
   )
 
@@ -535,7 +822,6 @@ class VideoQueueRepository(
         }.getOrDefault(0L)
     }
 
-    // Extract track frame rate & audio bitrate cleanly when container exposes them
     var detectedFps = 0f
     var detectedAudioBps = 0
     val extractor = MediaExtractor()
@@ -601,6 +887,7 @@ class VideoQueueRepository(
           frameRate = detectedFps,
           audioBitrateBps = detectedAudioBps,
           isValid = false,
+          isPermissionError = false,
           errorMessage = "Unsupported or corrupt video stream (no valid video track)",
         )
       } else {
@@ -615,9 +902,25 @@ class VideoQueueRepository(
           frameRate = detectedFps,
           audioBitrateBps = detectedAudioBps,
           isValid = true,
+          isPermissionError = false,
           errorMessage = null,
         )
       }
+    } catch (se: SecurityException) {
+      ProbedVideoInfo(
+        fileName = displayName,
+        sizeBytes = fileSize,
+        durationMs = 0L,
+        width = 0,
+        height = 0,
+        rotation = 0,
+        bitrateBps = 0,
+        frameRate = detectedFps,
+        audioBitrateBps = detectedAudioBps,
+        isValid = false,
+        isPermissionError = true,
+        errorMessage = "Storage permission lost for this video. Tap Relink File to re-select it.",
+      )
     } catch (t: Throwable) {
       ProbedVideoInfo(
         fileName = displayName,
@@ -630,6 +933,7 @@ class VideoQueueRepository(
         frameRate = detectedFps,
         audioBitrateBps = detectedAudioBps,
         isValid = false,
+        isPermissionError = t is java.io.FileNotFoundException,
         errorMessage = t.message ?: "Unable to read video metadata",
       )
     } finally {

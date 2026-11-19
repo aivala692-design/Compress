@@ -18,8 +18,12 @@ class DeviceGuardrailMonitor(private val context: Context) {
   }
 
   fun sample(requiredBytes: Long = LOW_STORAGE_THRESHOLD_BYTES): GuardrailState {
-    val availableBytes = queryAvailableStorageBytes()
-    val isLowStorage = availableBytes < maxOf(LOW_STORAGE_THRESHOLD_BYTES, requiredBytes)
+    val rawAvailableBytes = queryAvailableStorageBytes()
+    val hasValidStorageReading = rawAvailableBytes >= 0L
+    val availableBytes = if (hasValidStorageReading) rawAvailableBytes else 0L
+    val isLowStorage =
+      hasValidStorageReading &&
+        rawAvailableBytes < maxOf(LOW_STORAGE_THRESHOLD_BYTES, requiredBytes)
 
     val batteryStatus: Intent? =
       runCatching {
@@ -52,8 +56,8 @@ class DeviceGuardrailMonitor(private val context: Context) {
   fun queryAvailableStorageBytes(): Long {
     return runCatching {
       val stat = StatFs(context.cacheDir.absolutePath)
-      stat.availableBytes
-    }.getOrDefault(0L)
+      if (stat.totalBytes <= 0L) -1L else stat.availableBytes
+    }.getOrDefault(-1L)
   }
 
   private fun queryThermalLevel(): ThermalLevel {

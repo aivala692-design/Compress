@@ -7,6 +7,8 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.CompressXApplication
+import com.example.data.EnqueueBatchResult
+import com.example.data.RelinkResult
 import com.example.data.VideoJobEntity
 import com.example.engine.CompressionLogger
 import com.example.engine.MediaStoreMeta
@@ -32,8 +34,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 enum class QueueFilter(val label: String) {
@@ -115,6 +120,8 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
   private val guardrailsMonitor = app.guardrailMonitor
   private val replacementManager = app.mediaReplacementManager
 
+  private val queueMutationMutex = Mutex()
+
   private val selectedFilter = MutableStateFlow(QueueFilter.ALL)
   private val selectedApprovalJobIds = MutableStateFlow<Set<String>>(emptySet())
   private val isImporting = MutableStateFlow(false)
@@ -126,9 +133,10 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
   private val bannerMessage = MutableStateFlow<String?>(null)
   private val guardrailsFlow = MutableStateFlow(guardrailsMonitor.sample())
 
-  private var prevProcessingCount = 0
-  private var knownEligibleAwaitingIds = emptySet<String>()
-
+  /**
+   * Pure state derivation — ZERO side-effect mutations inside combine() to prevent re-entrant
+   * StateFlow loops and crashes during rapid queue mutations or deletions.
+   */
   val uiState: StateFlow<StudioUiState> =
     combine(
       queueRepo.allJobs,
@@ -178,22 +186,7 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           .map { it.id }
           .toSet()
 
-      val newlyArrivedEligible = currentEligibleIds - knownEligibleAwaitingIds
-      val sanitizedSelection = (selectedApproval intersect currentEligibleIds) + newlyArrivedEligible
-      if (sanitizedSelection != selectedApproval) {
-        selectedApprovalJobIds.value = sanitizedSelection
-      }
-      knownEligibleAwaitingIds = currentEligibleIds
-
-      if (prevProcessingCount > 0 && stats.processingCount == 0 && stats.awaitingApprovalCount > 0) {
-        if (currentEligibleIds.isNotEmpty()) {
-          showBatchReplaceDialog.value = true
-        } else {
-          bannerMessage.value =
-            "Compressed outputs ready. Read-only sources kept intact — tap Save Copies."
-        }
-      }
-      prevProcessingCount = stats.processingCount
+      val sanitizedSelection = selectedApproval intersect currentEligibleIds
 
       StudioUiState(
         jobs = jobs,
@@ -220,6 +213,41 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
       )
 
   init {
+    // Dedicated side-effect collector on main/viewModelScope for approval auto-selection & dialog trigger
+    viewModelScope.launch {
+      var prevProcessingCount = 0
+      var knownEligibleAwaitingIds = emptySet<String>()
+
+      queueRepo.allJobs.collect { jobs ->
+        val processingCount = jobs.count { it.status == JobStatus.PROCESSING }
+        val awaitingCount = jobs.count { it.status == JobStatus.AWAITING_APPROVAL }
+        val currentEligibleIds =
+          jobs
+            .filter {
+              it.status == JobStatus.AWAITING_APPROVAL &&
+                it.replacementStatus != ReplacementPermissionStatus.READ_ONLY
+            }
+            .map { it.id }
+            .toSet()
+
+        val newlyArrivedEligible = currentEligibleIds - knownEligibleAwaitingIds
+        selectedApprovalJobIds.update { existing ->
+          (existing intersect currentEligibleIds) + newlyArrivedEligible
+        }
+        knownEligibleAwaitingIds = currentEligibleIds
+
+        if (prevProcessingCount > 0 && processingCount == 0 && awaitingCount > 0) {
+          if (currentEligibleIds.isNotEmpty()) {
+            showBatchReplaceDialog.value = true
+          } else {
+            bannerMessage.value =
+              "Compressed outputs ready. Read-only sources kept intact — tap Save Copies."
+          }
+        }
+        prevProcessingCount = processingCount
+      }
+    }
+
     viewModelScope.launch {
       while (isActive) {
         guardrailsFlow.value = guardrailsMonitor.sample()
@@ -299,13 +327,13 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           ?: "Read-only source provider does not support replacement. Tap Save Copy instead."
       return
     }
-    val current = selectedApprovalJobIds.value
-    selectedApprovalJobIds.value = if (jobId in current) current - jobId else current + jobId
+    selectedApprovalJobIds.update { current ->
+      if (jobId in current) current - jobId else current + jobId
+    }
   }
 
   fun selectAllEligibleForReplacement() {
-    val eligibleIds =
-      uiState.value.eligibleAwaitingApprovalJobs.map { it.id }.toSet()
+    val eligibleIds = uiState.value.eligibleAwaitingApprovalJobs.map { it.id }.toSet()
     selectedApprovalJobIds.value = eligibleIds
     if (eligibleIds.isEmpty()) {
       val readOnlyCount = uiState.value.readOnlyAwaitingApprovalJobs.size
@@ -354,9 +382,9 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           return@launch
         }
 
-        val prep = withContext(Dispatchers.IO) { replacementManager.prepareBatchDeleteApproval(candidates) }
+        val prep =
+          withContext(Dispatchers.IO) { replacementManager.prepareBatchDeleteApproval(candidates) }
 
-        // Surface explicit Read-Only / verification statuses without requesting doomed permissions
         for ((badJob, reason) in prep.readOnlyOrFailedJobs) {
           val assessment =
             withContext(Dispatchers.IO) {
@@ -372,9 +400,12 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         if (prep.deleteRequestIntentSender != null && prep.deleteApprovedJobIds.isNotEmpty()) {
-          // Centralized ONE-dialog MediaStore.createDeleteRequest() on Android 11+ (API 30+)
           for (id in prep.deleteApprovedJobIds) {
-            queueRepo.updateReplacementStatus(id, ReplacementPermissionStatus.PENDING_BATCH_APPROVAL, null)
+            queueRepo.updateReplacementStatus(
+              id,
+              ReplacementPermissionStatus.PENDING_BATCH_APPROVAL,
+              null,
+            )
           }
           pendingSystemApproval.value =
             PendingSystemApprovalRequest(
@@ -553,7 +584,6 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           savedBytes += (job.originalSizeBytes - outcome.outputSizeBytes).coerceAtLeast(0L)
         }
         is ReplacementOutcome.NeedsSystemIntentSender -> {
-          // Android 10 RecoverableSecurityException fallback -> prompt for remaining
           val remainingIds = jobs.drop(idx).map { it.id }.toSet()
           pendingSystemApproval.value =
             PendingSystemApprovalRequest(
@@ -561,7 +591,12 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
               kind = SystemApprovalKind.LEGACY_SINGLE_WRITE,
               approvedJobIds = remainingIds,
             )
-          return ExecutionBatchSummary(replacedCount, failedCount, savedBytes, pausedForIntentSender = true)
+          return ExecutionBatchSummary(
+            replacedCount,
+            failedCount,
+            savedBytes,
+            pausedForIntentSender = true,
+          )
         }
         is ReplacementOutcome.Failed -> {
           val isReadOnly =
@@ -591,7 +626,12 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
           else -> null
         }
     }
-    return ExecutionBatchSummary(replacedCount, failedCount, savedBytes, pausedForIntentSender = false)
+    return ExecutionBatchSummary(
+      replacedCount,
+      failedCount,
+      savedBytes,
+      pausedForIntentSender = false,
+    )
   }
 
   fun saveStagedJobAsCopy(jobId: String) {
@@ -725,17 +765,15 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
               captionText = payload.captionText ?: existingReview?.captionText,
               skippedDuplicateCount = (existingReview?.skippedDuplicateCount ?: 0) + skippedCount,
             )
-          bannerMessage.value =
-            buildString {
-              append("Received $addedCount shared video${if (addedCount == 1) "" else "s"}")
-              if (skippedCount > 0) {
-                append(" ($skippedCount duplicate${if (skippedCount == 1) "" else "s"} skipped)")
-              }
-            }
+          bannerMessage.value = formatEnqueueMessage(result, isShared = true)
         } else if (skippedCount > 0) {
-          selectedFilter.value = QueueFilter.QUEUED
-          bannerMessage.value =
-            "Shared video${if (skippedCount == 1) " is" else "s are"} already in the compression queue"
+          selectedFilter.value =
+            if (result.skippedCompletedCount > 0 && result.skippedActiveCount == 0) {
+              QueueFilter.COMPLETED
+            } else {
+              QueueFilter.QUEUED
+            }
+          bannerMessage.value = formatEnqueueMessage(result, isShared = true)
         }
       } catch (t: Throwable) {
         CompressionLogger.e("CompressXVM", "Failed receiving shared videos", t)
@@ -776,28 +814,84 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
             config = currentConfig,
             deduplicateActive = true,
           )
-        val addedCount = result.addedJobs.size
-        val skipped = result.skippedDuplicateCount
-        val readOnlyAdded =
-          result.addedJobs.count { it.replacementStatus == ReplacementPermissionStatus.READ_ONLY }
-        bannerMessage.value =
-          when {
-            addedCount > 0 && readOnlyAdded > 0 ->
-              "Added $addedCount video${if (addedCount == 1) "" else "s"} ($readOnlyAdded read-only source${if (readOnlyAdded == 1) "" else "s"} will save as copy)"
-            addedCount > 0 && skipped > 0 ->
-              "Added $addedCount video${if (addedCount == 1) "" else "s"} ($skipped duplicate${if (skipped == 1) "" else "s"} skipped)"
-            addedCount > 0 ->
-              "Added $addedCount video${if (addedCount == 1) "" else "s"} to batch queue"
-            skipped > 0 ->
-              "Selected video${if (skipped == 1) " is" else "s are"} already in the queue"
-            else -> null
-          }
+        bannerMessage.value = formatEnqueueMessage(result, isShared = false)
       } catch (t: Throwable) {
         CompressionLogger.e("CompressXVM", "Failed to import selected videos", t)
         bannerMessage.value =
           "Failed to import selected videos: ${CompressionLogger.formatUserErrorMessage(t)}"
       } finally {
         isImporting.value = false
+      }
+    }
+  }
+
+  private fun formatEnqueueMessage(result: EnqueueBatchResult, isShared: Boolean): String? {
+    val added = result.addedJobs.size
+    val skipped = result.skippedDuplicateCount
+    val readOnlyAdded =
+      result.addedJobs.count { it.replacementStatus == ReplacementPermissionStatus.READ_ONLY }
+    val verb = if (isShared) "Received" else "Added"
+    val suffix = if (isShared) "shared video" else "video"
+
+    if (added > 0) {
+      return buildString {
+        append("$verb $added $suffix${if (added == 1) "" else "s"}")
+        if (skipped > 0) {
+          val dupDetail =
+            when {
+              result.skippedCompletedCount > 0 && result.skippedActiveCount == 0 ->
+                "$skipped already compressed"
+              result.skippedCompletedCount > 0 ->
+                "$skipped duplicate${if (skipped == 1) "" else "s"} (${result.skippedCompletedCount} already compressed)"
+              else ->
+                "$skipped duplicate${if (skipped == 1) "" else "s"} skipped"
+            }
+          append(" • $dupDetail")
+        }
+        if (readOnlyAdded > 0) {
+          append(" • $readOnlyAdded read-only")
+        }
+      }
+    }
+
+    if (skipped > 0) {
+      return when {
+        result.skippedCompletedCount == skipped ->
+          if (skipped == 1) "Duplicate skipped: this video was already compressed."
+          else "$skipped duplicates skipped: these videos were already compressed."
+        result.skippedCompletedCount > 0 ->
+          "$skipped duplicates skipped (${result.skippedCompletedCount} already compressed, ${result.skippedActiveCount + result.skippedInBatchCount} in queue)."
+        else ->
+          if (skipped == 1) "Duplicate skipped: this video is already in the queue."
+          else "$skipped duplicates skipped: already in the compression queue."
+      }
+    }
+    return null
+  }
+
+  fun relinkJob(jobId: String, newUri: Uri) {
+    viewModelScope.launch {
+      try {
+        when (val res = queueRepo.relinkJob(jobId, newUri)) {
+          is RelinkResult.Success -> {
+            bannerMessage.value = "Relinked ${res.job.fileName} — queued for compression."
+            if (uiState.value.isBatchRunning) {
+              // Active runner will naturally dequeue this job next
+            }
+          }
+          is RelinkResult.DuplicateConflict -> {
+            bannerMessage.value = "Relink cancelled: ${res.message}"
+          }
+          is RelinkResult.InvalidFile -> {
+            bannerMessage.value = "Cannot relink: ${res.message}"
+          }
+          RelinkResult.NotFound -> {
+            bannerMessage.value = "Queue item was already removed."
+          }
+        }
+      } catch (t: Throwable) {
+        CompressionLogger.e("CompressXVM", "Relink failed for $jobId", t)
+        bannerMessage.value = "Relink failed: ${CompressionLogger.formatUserErrorMessage(t)}"
       }
     }
   }
@@ -852,62 +946,154 @@ class CompressXViewModel(application: Application) : AndroidViewModel(applicatio
 
   fun cancelJob(jobId: String) {
     viewModelScope.launch {
-      val job = queueRepo.getJobById(jobId)
-      if (job?.status == JobStatus.PROCESSING) {
-        CompressionForegroundService.cancelActiveJob(app)
-      } else {
-        queueRepo.cancelJob(jobId)
+      queueMutationMutex.withLock {
+        runCatching {
+          val job = withContext(Dispatchers.IO) { queueRepo.getJobById(jobId) }
+          val isActive =
+            job?.status == JobStatus.PROCESSING || app.batchQueueRunner.activeJobId == jobId
+          if (isActive) {
+            CompressionForegroundService.cancelSpecificJob(app, jobId)
+          }
+          queueRepo.cancelJob(jobId)
+        }.onFailure {
+          CompressionLogger.e("CompressXVM", "Failed cancelling job $jobId", it)
+          bannerMessage.value = "Unable to cancel video: ${CompressionLogger.formatUserErrorMessage(it)}"
+        }
       }
     }
   }
 
   fun retryJob(jobId: String) {
     viewModelScope.launch {
-      queueRepo.retryJob(jobId)
-      startQueueOrFallback(isAutoResume = false)
+      val job = withContext(Dispatchers.IO) { queueRepo.getJobById(jobId) } ?: return@launch
+      if (job.needsRelink && !queueRepo.isUriReadable(Uri.parse(job.sourceUri))) {
+        bannerMessage.value =
+          "Storage permission lost for ${job.fileName}. Tap Relink File to re-select it."
+        return@launch
+      }
+      val retried = queueRepo.retryJob(jobId)
+      if (retried) {
+        startQueueOrFallback(isAutoResume = false)
+      }
     }
   }
 
   fun retryAllFailed() {
     viewModelScope.launch {
-      queueRepo.retryAllFailedJobs()
-      startQueueOrFallback(isAutoResume = false)
+      try {
+        val result = queueRepo.retryAllFailedJobs()
+        if (result.retriedCount > 0) {
+          startQueueOrFallback(isAutoResume = false)
+          bannerMessage.value =
+            if (result.needsRelinkRemainingCount > 0) {
+              "Retrying ${result.retriedCount} failed video(s) • ${result.needsRelinkRemainingCount} need Relink File."
+            } else {
+              "Retrying ${result.retriedCount} failed video${if (result.retriedCount == 1) "" else "s"}."
+            }
+        } else if (result.needsRelinkRemainingCount > 0) {
+          bannerMessage.value =
+            "${result.needsRelinkRemainingCount} failed video(s) lost storage access — tap Relink File on each card."
+        } else {
+          bannerMessage.value = "No failed videos available to retry."
+        }
+      } catch (t: Throwable) {
+        CompressionLogger.e("CompressXVM", "Retry all failed error", t)
+        bannerMessage.value = "Retry failed: ${CompressionLogger.formatUserErrorMessage(t)}"
+      }
     }
   }
 
+  /**
+   * Thread-safe, race-free deletion of ANY queue item (QUEUED, PROCESSING, PAUSED, FAILED,
+   * AWAITING_APPROVAL, COMPLETED, CANCELLED). If the item is currently encoding, ONLY that job is
+   * cancelled while the rest of the batch continues uninterrupted.
+   */
   fun deleteJob(jobId: String) {
-    viewModelScope.launch { queueRepo.deleteJob(jobId) }
+    viewModelScope.launch {
+      queueMutationMutex.withLock {
+        runCatching {
+          selectedApprovalJobIds.update { it - jobId }
+          shareReviewState.update { review ->
+            if (review == null) null
+            else {
+              val remaining = review.jobIds.filterNot { it == jobId }
+              if (remaining.isEmpty()) null else review.copy(jobIds = remaining)
+            }
+          }
+
+          val existing = withContext(Dispatchers.IO) { queueRepo.getJobById(jobId) }
+          val isActive =
+            existing?.status == JobStatus.PROCESSING || app.batchQueueRunner.activeJobId == jobId
+          if (isActive) {
+            CompressionForegroundService.cancelSpecificJob(app, jobId)
+          }
+
+          queueRepo.deleteJob(jobId)
+        }.onFailure {
+          CompressionLogger.e("CompressXVM", "Safe deleteJob failed for $jobId", it)
+          bannerMessage.value = "Unable to remove item: ${CompressionLogger.formatUserErrorMessage(it)}"
+        }
+      }
+    }
   }
 
   fun clearCompleted() {
-    viewModelScope.launch { queueRepo.clearCompletedAndCancelled() }
+    viewModelScope.launch {
+      queueMutationMutex.withLock {
+        runCatching { queueRepo.clearCompletedAndCancelled() }
+          .onFailure { CompressionLogger.e("CompressXVM", "clearCompleted failed", it) }
+      }
+    }
   }
 
   fun clearAllQueue() {
     viewModelScope.launch {
-      CompressionForegroundService.pauseQueue(app)
-      delay(150L)
-      queueRepo.clearAll()
+      queueMutationMutex.withLock {
+        runCatching {
+          CompressionForegroundService.pauseQueue(app)
+          delay(150L)
+          selectedApprovalJobIds.value = emptySet()
+          shareReviewState.value = null
+          queueRepo.clearAll()
+        }.onFailure { CompressionLogger.e("CompressXVM", "clearAllQueue failed", it) }
+      }
+    }
+  }
+
+  fun moveJobById(jobId: String, direction: Int, visibleJobIds: List<String>) {
+    if (direction == 0) return
+    viewModelScope.launch {
+      queueMutationMutex.withLock {
+        runCatching {
+          val fromIdx = visibleJobIds.indexOf(jobId)
+          val toIdx = fromIdx + direction
+          if (fromIdx < 0 || toIdx !in visibleJobIds.indices) return@withLock
+
+          val mutableVisible = visibleJobIds.toMutableList()
+          val movedId = mutableVisible.removeAt(fromIdx)
+          mutableVisible.add(toIdx, movedId)
+
+          val allOrdered = uiState.value.jobs.map { it.id }.toMutableList()
+          val visibleSet = visibleJobIds.toSet()
+          val slots = allOrdered.mapIndexedNotNull { idx, id -> if (id in visibleSet) idx else null }
+          slots.forEachIndexed { slotIdx, globalIdx ->
+            if (slotIdx < mutableVisible.size && globalIdx in allOrdered.indices) {
+              allOrdered[globalIdx] = mutableVisible[slotIdx]
+            }
+          }
+          queueRepo.reorderJobs(allOrdered)
+        }.onFailure {
+          CompressionLogger.w("CompressXVM", "Safe reorder skipped due to concurrent update", it)
+        }
+      }
     }
   }
 
   fun moveJob(fromIndex: Int, toIndex: Int, visibleJobs: List<VideoJobEntity>) {
     if (fromIndex == toIndex) return
-    if (fromIndex !in visibleJobs.indices || toIndex !in visibleJobs.indices) return
-    val mutable = visibleJobs.toMutableList()
-    val moved = mutable.removeAt(fromIndex)
-    mutable.add(toIndex, moved)
-    viewModelScope.launch {
-      val allOrdered = uiState.value.jobs.toMutableList()
-      val visibleIds = visibleJobs.map { it.id }.toSet()
-      val slots = allOrdered.mapIndexedNotNull { idx, item -> if (item.id in visibleIds) idx else null }
-      slots.forEachIndexed { slotIdx, globalIdx ->
-        if (slotIdx < mutable.size) {
-          allOrdered[globalIdx] = mutable[slotIdx]
-        }
-      }
-      queueRepo.reorderJobs(allOrdered.map { it.id })
-    }
+    val target = visibleJobs.getOrNull(fromIndex) ?: return
+    val direction = if (toIndex > fromIndex) 1 else -1
+    moveJobById(target.id, direction, visibleJobs.map { it.id })
   }
 
   fun selectFilter(filter: QueueFilter) {

@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -294,6 +295,7 @@ fun VideoJobCard(
   onCancel: () -> Unit,
   onRetry: () -> Unit,
   onDelete: () -> Unit,
+  onRelink: ((String) -> Unit)? = null,
   onApproveReplace: ((String) -> Unit)? = null,
   onSaveCopyInstead: ((String) -> Unit)? = null,
   onPreviewOutput: ((VideoJobEntity) -> Unit)? = null,
@@ -409,13 +411,13 @@ fun VideoJobCard(
           Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment = Alignment.Top,
           ) {
             Text(
               text = job.fileName,
               style = MaterialTheme.typography.titleMedium,
               color = MaterialTheme.colorScheme.onSurface,
-              maxLines = 1,
+              maxLines = 2,
               overflow = TextOverflow.Ellipsis,
               modifier = Modifier.weight(1f).padding(end = 8.dp),
             )
@@ -426,14 +428,16 @@ fun VideoJobCard(
 
           val dimText =
             if (job.width > 0 && job.height > 0) "${job.width}×${job.height}" else "Video"
+          val durTag =
+            if (job.durationMs > 0L) " • ${FormatUtils.formatDuration(job.durationMs)}" else ""
           val fpsTag =
             if (job.sourceFrameRate >= 1f) " • ${job.sourceFrameRate.toInt()}fps" else ""
           Text(
             text =
-              "$dimText$fpsTag • ${job.preset.label} • ${job.targetResolution.label} ${job.targetCodec.shortTag}",
+              "$dimText$durTag$fpsTag • ${job.preset.label} • ${job.targetResolution.label} ${job.targetCodec.shortTag}",
             style = MaterialTheme.typography.labelSmall,
             color = TextSecondary,
-            maxLines = 1,
+            maxLines = 2,
             overflow = TextOverflow.Ellipsis,
           )
 
@@ -632,15 +636,36 @@ fun VideoJobCard(
 
         when (job.status) {
           JobStatus.QUEUED,
-          JobStatus.PROCESSING,
           JobStatus.PAUSED -> {
+            IconButton(
+              onClick = onDelete,
+              modifier = Modifier.size(48.dp).testTag("delete_job_${job.id}"),
+            ) {
+              Icon(
+                imageVector = Icons.Default.DeleteOutline,
+                contentDescription = "Remove from queue",
+                tint = CrimsonError,
+              )
+            }
+          }
+          JobStatus.PROCESSING -> {
             IconButton(
               onClick = onCancel,
               modifier = Modifier.size(48.dp).testTag("cancel_job_${job.id}"),
             ) {
               Icon(
                 imageVector = Icons.Default.Close,
-                contentDescription = "Cancel job",
+                contentDescription = "Cancel active compression",
+                tint = AmberWarning,
+              )
+            }
+            IconButton(
+              onClick = onDelete,
+              modifier = Modifier.size(48.dp).testTag("delete_job_${job.id}"),
+            ) {
+              Icon(
+                imageVector = Icons.Default.DeleteOutline,
+                contentDescription = "Stop and remove from queue",
                 tint = CrimsonError,
               )
             }
@@ -724,15 +749,35 @@ fun VideoJobCard(
           }
           JobStatus.FAILED,
           JobStatus.CANCELLED -> {
-            IconButton(
-              onClick = onRetry,
-              modifier = Modifier.size(48.dp).testTag("retry_job_${job.id}"),
-            ) {
-              Icon(
-                imageVector = Icons.Default.Refresh,
-                contentDescription = "Retry job",
-                tint = CyanPrimary,
-              )
+            if (job.status == JobStatus.FAILED && job.needsRelink && onRelink != null) {
+              FilledTonalButton(
+                onClick = { onRelink(job.id) },
+                colors =
+                  ButtonDefaults.filledTonalButtonColors(
+                    containerColor = CyanPrimary.copy(alpha = 0.2f),
+                    contentColor = CyanPrimary,
+                  ),
+                modifier = Modifier.height(40.dp).testTag("relink_job_${job.id}"),
+              ) {
+                Icon(
+                  imageVector = Icons.Default.Link,
+                  contentDescription = null,
+                  modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Relink File", style = MaterialTheme.typography.labelMedium)
+              }
+            } else {
+              IconButton(
+                onClick = onRetry,
+                modifier = Modifier.size(48.dp).testTag("retry_job_${job.id}"),
+              ) {
+                Icon(
+                  imageVector = Icons.Default.Refresh,
+                  contentDescription = "Retry job",
+                  tint = CyanPrimary,
+                )
+              }
             }
             IconButton(
               onClick = onDelete,

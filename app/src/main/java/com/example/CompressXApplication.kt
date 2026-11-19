@@ -103,10 +103,10 @@ class CompressXApplication : Application() {
   }
 
   fun cancelJobDirect(jobId: String) {
+    batchQueueRunner.cancelSpecificJob(jobId)
     appScope.launch {
       runCatching { queueRepository.cancelJob(jobId) }
         .onFailure { CompressionLogger.e("CompressXApp", "Direct cancel failed for $jobId", it) }
-      compressionEngine.cancelActive()
     }
   }
 }

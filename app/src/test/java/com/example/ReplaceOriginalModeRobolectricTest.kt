@@ -279,7 +279,11 @@ class ReplaceOriginalModeRobolectricTest {
 
     val migratedDb =
       Room.databaseBuilder(context, CompressXDatabase::class.java, dbName)
-        .addMigrations(CompressXDatabase.MIGRATION_1_2, CompressXDatabase.MIGRATION_2_3)
+        .addMigrations(
+          CompressXDatabase.MIGRATION_1_2,
+          CompressXDatabase.MIGRATION_2_3,
+          CompressXDatabase.MIGRATION_3_4,
+        )
         .allowMainThreadQueries()
         .build()
 

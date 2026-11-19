@@ -75,8 +75,16 @@ class VideoCompressionEngine(
   private val mainHandler = Handler(Looper.getMainLooper())
 
   @Volatile private var activeTransformer: Transformer? = null
+  @Volatile private var activeJobId: String? = null
 
   fun workDirectory(): File = File(context.cacheDir, "compressx_work").apply { mkdirs() }
+
+  fun deleteTempFileForJob(jobId: String) {
+    runCatching {
+      val temp = File(workDirectory(), "${jobId}.tmp.mp4")
+      if (temp.exists()) temp.delete()
+    }.onFailure { CompressionLogger.w(TAG, "Failed deleting temp file for job $jobId", it) }
+  }
 
   fun cleanupOrphanedTempFiles() {
     runCatching {
@@ -88,11 +96,23 @@ class VideoCompressionEngine(
     }.onFailure { CompressionLogger.w(TAG, "Failed cleaning orphaned temp files", it) }
   }
 
+  fun cancelJob(targetJobId: String) {
+    mainHandler.post {
+      if (activeJobId == targetJobId) {
+        runCatching { activeTransformer?.cancel() }
+          .onFailure { CompressionLogger.w(TAG, "Error cancelling transformer for job $targetJobId", it) }
+        activeTransformer = null
+        activeJobId = null
+      }
+    }
+  }
+
   fun cancelActive() {
     mainHandler.post {
       runCatching { activeTransformer?.cancel() }
         .onFailure { CompressionLogger.w(TAG, "Error cancelling active transformer", it) }
       activeTransformer = null
+      activeJobId = null
     }
   }
 
@@ -135,6 +155,7 @@ class VideoCompressionEngine(
         try {
           attemptResult =
             runTransformerAttempt(
+              jobId = jobId,
               sourceUri = sourceUri,
               tempOutputFile = tempOutputFile,
               spec = spec,
@@ -173,6 +194,7 @@ class VideoCompressionEngine(
               )
             attemptResult =
               runTransformerAttempt(
+                jobId = jobId,
                 sourceUri = sourceUri,
                 tempOutputFile = tempOutputFile,
                 spec = audioSafeSpec,
@@ -383,6 +405,7 @@ class VideoCompressionEngine(
   }
 
   private suspend fun runTransformerAttempt(
+    jobId: String,
     sourceUri: Uri,
     tempOutputFile: File,
     spec: CompressionAttemptSpec,
@@ -396,7 +419,10 @@ class VideoCompressionEngine(
         fun failAttempt(error: Throwable) {
           if (!finished.compareAndSet(false, true)) return
           progressRunnable?.let { mainHandler.removeCallbacks(it) }
-          activeTransformer = null
+          if (activeJobId == jobId) {
+            activeTransformer = null
+            activeJobId = null
+          }
           if (continuation.isActive) {
             continuation.resumeWithException(error)
           }
@@ -451,7 +477,10 @@ class VideoCompressionEngine(
               override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                 if (!finished.compareAndSet(false, true)) return
                 progressRunnable?.let { mainHandler.removeCallbacks(it) }
-                activeTransformer = null
+                if (activeJobId == jobId) {
+                  activeTransformer = null
+                  activeJobId = null
+                }
                 runCatching { onProgress(100) }
                 if (continuation.isActive) {
                   continuation.resume(exportResult)
@@ -476,6 +505,7 @@ class VideoCompressionEngine(
               .build()
 
           activeTransformer = transformer
+          activeJobId = jobId
 
           continuation.invokeOnCancellation {
             finished.set(true)
@@ -483,7 +513,10 @@ class VideoCompressionEngine(
             mainHandler.post {
               runCatching { transformer.cancel() }
                 .onFailure { CompressionLogger.w(TAG, "Failed cancelling transformer", it) }
-              if (activeTransformer === transformer) activeTransformer = null
+              if (activeTransformer === transformer) {
+                activeTransformer = null
+                activeJobId = null
+              }
             }
           }
 
@@ -537,7 +570,7 @@ class VideoCompressionEngine(
     }
   }
 
-  private fun verifyEncodedOutputPlayable(file: File) {
+  internal fun verifyEncodedOutputPlayable(file: File) {
     if (!file.exists() || file.length() < 1024L) {
       throw IOException("Compressed output file is empty or corrupt (${file.length()} bytes)")
     }

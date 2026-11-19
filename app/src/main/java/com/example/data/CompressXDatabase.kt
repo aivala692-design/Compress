@@ -8,7 +8,7 @@ import androidx.room.TypeConverters
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [VideoJobEntity::class], version = 3, exportSchema = false)
+@Database(entities = [VideoJobEntity::class], version = 4, exportSchema = false)
 @TypeConverters(CompressXTypeConverters::class)
 abstract class CompressXDatabase : RoomDatabase() {
   abstract fun videoJobDao(): VideoJobDao
@@ -45,6 +45,19 @@ abstract class CompressXDatabase : RoomDatabase() {
         }
       }
 
+    val MIGRATION_3_4 =
+      object : Migration(3, 4) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+          db.execSQL("ALTER TABLE video_jobs ADD COLUMN contentFingerprint TEXT")
+          db.execSQL(
+            "ALTER TABLE video_jobs ADD COLUMN needsRelink INTEGER NOT NULL DEFAULT 0"
+          )
+          db.execSQL(
+            "ALTER TABLE video_jobs ADD COLUMN hasPersistablePermission INTEGER NOT NULL DEFAULT 0"
+          )
+        }
+      }
+
     fun getInstance(context: Context): CompressXDatabase =
       INSTANCE
         ?: synchronized(this) {
@@ -54,7 +67,7 @@ abstract class CompressXDatabase : RoomDatabase() {
                 CompressXDatabase::class.java,
                 "compressx_studio.db",
               )
-              .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+              .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
               .build()
               .also { INSTANCE = it }
         }

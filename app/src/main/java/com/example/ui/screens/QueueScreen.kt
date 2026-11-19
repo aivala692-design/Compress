@@ -85,9 +85,10 @@ fun QueueScreen(
   onAddSafVideos: () -> Unit,
   onStartOrResume: () -> Unit,
   onPause: () -> Unit,
-  onMoveJob: (Int, Int, List<VideoJobEntity>) -> Unit,
+  onMoveJobById: (String, Int, List<String>) -> Unit,
   onCancelJob: (String) -> Unit,
   onRetryJob: (String) -> Unit,
+  onRelinkJob: (String) -> Unit,
   onRetryAllFailed: () -> Unit,
   onDeleteJob: (String) -> Unit,
   onClearCompleted: () -> Unit,
@@ -135,16 +136,18 @@ fun QueueScreen(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
       ) {
-        Column {
+        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
           Text(
             text = "Batch Queue (${uiState.jobs.size})",
             style = MaterialTheme.typography.headlineMedium,
             color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
           )
           Text(
             text = "Long-press drag handle or arrows to reorder",
             style = MaterialTheme.typography.bodyMedium,
             color = TextSecondary,
+            maxLines = 1,
           )
         }
 
@@ -413,17 +416,36 @@ fun QueueScreen(
         }
       }
 
-      // Filter Chips & Batch Cleanup Actions
+      // Filter Chips with Live Counts & Batch Cleanup Actions
+      val filterCounts =
+        remember(uiState.jobs) {
+          mapOf(
+            QueueFilter.ALL to uiState.jobs.size,
+            QueueFilter.QUEUED to
+              uiState.jobs.count { it.status == JobStatus.QUEUED || it.status == JobStatus.PAUSED },
+            QueueFilter.PROCESSING to uiState.jobs.count { it.status == JobStatus.PROCESSING },
+            QueueFilter.AWAITING to uiState.jobs.count { it.status == JobStatus.AWAITING_APPROVAL },
+            QueueFilter.COMPLETED to uiState.jobs.count { it.status == JobStatus.COMPLETED },
+            QueueFilter.FAILED to
+              uiState.jobs.count {
+                it.status == JobStatus.FAILED || it.status == JobStatus.CANCELLED
+              },
+          )
+        }
+
       LazyRow(
         contentPadding = PaddingValues(horizontal = 16.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
       ) {
         items(QueueFilter.entries) { filter ->
           val selected = uiState.selectedFilter == filter
+          val count = filterCounts[filter] ?: 0
           FilterChip(
             selected = selected,
             onClick = { onSelectFilter(filter) },
-            label = { Text(filter.label) },
+            label = {
+              Text(if (count > 0 || filter == QueueFilter.ALL) "${filter.label} ($count)" else filter.label)
+            },
             colors =
               FilterChipDefaults.filterChipColors(
                 selectedContainerColor = CyanPrimary.copy(alpha = 0.2f),
@@ -517,6 +539,7 @@ fun QueueScreen(
           }
         }
       } else {
+        val visibleIds = remember(filteredJobs) { filteredJobs.map { it.id } }
         LazyColumn(
           modifier = Modifier.fillMaxSize(),
           contentPadding = PaddingValues(16.dp),
@@ -525,7 +548,7 @@ fun QueueScreen(
           itemsIndexed(items = filteredJobs, key = { _, item -> item.id }) { index, job ->
             val isDragging = draggedJobId == job.id
             val dragModifier =
-              Modifier.pointerInput(job.id, filteredJobs.size) {
+              Modifier.pointerInput(job.id, visibleIds) {
                 detectDragGesturesAfterLongPress(
                   onDragStart = {
                     draggedJobId = job.id
@@ -543,13 +566,13 @@ fun QueueScreen(
                     change.consume()
                     dragOffsetY += dragAmount.y
                     val thresholdPx = 140f
-                    val currentIdx = filteredJobs.indexOfFirst { it.id == job.id }
+                    val currentIdx = visibleIds.indexOf(job.id)
                     if (currentIdx >= 0) {
-                      if (dragOffsetY > thresholdPx && currentIdx < filteredJobs.lastIndex) {
-                        onMoveJob(currentIdx, currentIdx + 1, filteredJobs)
+                      if (dragOffsetY > thresholdPx && currentIdx < visibleIds.lastIndex) {
+                        onMoveJobById(job.id, +1, visibleIds)
                         dragOffsetY -= thresholdPx
                       } else if (dragOffsetY < -thresholdPx && currentIdx > 0) {
-                        onMoveJob(currentIdx, currentIdx - 1, filteredJobs)
+                        onMoveJobById(job.id, -1, visibleIds)
                         dragOffsetY += thresholdPx
                       }
                     }
@@ -557,22 +580,24 @@ fun QueueScreen(
                 )
               }
 
+            val prevJob = filteredJobs.getOrNull(index - 1)
+            val nextJob = filteredJobs.getOrNull(index + 1)
             VideoJobCard(
               job = job,
-              canMoveUp = index > 0 && filteredJobs[index - 1].status == JobStatus.QUEUED,
-              canMoveDown =
-                index < filteredJobs.lastIndex && filteredJobs[index + 1].status == JobStatus.QUEUED,
+              canMoveUp = prevJob?.status == JobStatus.QUEUED,
+              canMoveDown = nextJob?.status == JobStatus.QUEUED,
               isDragging = isDragging,
               dragModifier = dragModifier,
               hasHardwareEncoder = hasHardwareEncoder,
               preferHardware = preferHardware,
               isSelectedForApproval = job.id in uiState.selectedApprovalJobIds,
               onToggleApprovalSelect = onToggleApprovalSelect,
-              onMoveUp = { onMoveJob(index, index - 1, filteredJobs) },
-              onMoveDown = { onMoveJob(index, index + 1, filteredJobs) },
+              onMoveUp = { onMoveJobById(job.id, -1, visibleIds) },
+              onMoveDown = { onMoveJobById(job.id, +1, visibleIds) },
               onCancel = { onCancelJob(job.id) },
               onRetry = { onRetryJob(job.id) },
               onDelete = { onDeleteJob(job.id) },
+              onRelink = { onRelinkJob(it) },
               onApproveReplace = onApproveReplace,
               onSaveCopyInstead = onSaveCopyInstead,
               onPreviewOutput = onPreviewOutput,

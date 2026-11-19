@@ -115,16 +115,20 @@ fun DashboardScreen(
           horizontalArrangement = Arrangement.SpaceBetween,
           verticalAlignment = Alignment.CenterVertically,
         ) {
-          Column {
+          Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
             Text(
               text = "CompressX Studio",
               style = MaterialTheme.typography.headlineMedium,
               color = MaterialTheme.colorScheme.onSurface,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
             )
             Text(
               text = "Offline Batch Media Engine",
               style = MaterialTheme.typography.bodyMedium,
               color = TextSecondary,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
             )
           }
 
@@ -717,6 +721,21 @@ fun DashboardScreen(
             Icon(Icons.Default.FolderOpen, contentDescription = null, tint = BlueSecondary)
             Spacer(modifier = Modifier.width(8.dp))
             Text("Browse Device Folders (SAF)", color = MaterialTheme.colorScheme.onSurface)
+          }
+
+          if (uiState.stats.needsRelinkCount > 0) {
+            OutlinedButton(
+              onClick = { onNavigateToQueue(QueueFilter.FAILED) },
+              modifier = Modifier.fillMaxWidth().height(48.dp).testTag("relink_needed_button"),
+              shape = RoundedCornerShape(14.dp),
+            ) {
+              Icon(Icons.Default.FolderOpen, contentDescription = null, tint = AmberWarning)
+              Spacer(modifier = Modifier.width(8.dp))
+              Text(
+                "${uiState.stats.needsRelinkCount} Video${if (uiState.stats.needsRelinkCount == 1) "" else "s"} Need Relink",
+                color = AmberWarning,
+              )
+            }
           }
 
           if (uiState.stats.failedCount > 0) {

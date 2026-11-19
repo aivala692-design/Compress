@@ -2,10 +2,13 @@ package com.example.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
@@ -116,6 +119,16 @@ fun CompressXApp(
   val snackbarHostState = remember { SnackbarHostState() }
   var previewJob by remember { mutableStateOf<VideoJobEntity?>(null) }
 
+  var pendingRelinkJobId by remember { mutableStateOf<String?>(null) }
+
+  // Automatically dismiss preview dialog if the previewed job is removed from the queue
+  LaunchedEffect(uiState.jobs, previewJob?.id) {
+    val previewId = previewJob?.id ?: return@LaunchedEffect
+    if (uiState.jobs.none { it.id == previewId }) {
+      previewJob = null
+    }
+  }
+
   // Android Photo Picker (PickVisualMedia.VideoOnly): multi-video selection without broad storage permissions
   val pickMediaVideosLauncher =
     rememberLauncherForActivityResult(
@@ -126,13 +139,48 @@ fun CompressXApp(
       }
     }
 
-  // Storage Access Framework: Multi-video file browser for external/custom folders
+  // Persistable Storage Access Framework contracts so read/write URI grants survive app restarts
+  val persistableOpenMultipleContract = remember {
+    object : ActivityResultContracts.OpenMultipleDocuments() {
+      override fun createIntent(context: Context, input: Array<String>): Intent {
+        return super.createIntent(context, input).apply {
+          addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+              Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+              Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+          )
+        }
+      }
+    }
+  }
+
+  val persistableOpenSingleContract = remember {
+    object : ActivityResultContracts.OpenDocument() {
+      override fun createIntent(context: Context, input: Array<String>): Intent {
+        return super.createIntent(context, input).apply {
+          addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+              Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+              Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+          )
+        }
+      }
+    }
+  }
+
   val pickSafVideosLauncher =
-    rememberLauncherForActivityResult(
-      contract = ActivityResultContracts.OpenMultipleDocuments(),
-    ) { uris ->
+    rememberLauncherForActivityResult(contract = persistableOpenMultipleContract) { uris ->
       if (uris.isNotEmpty()) {
         viewModel.onVideosSelected(uris)
+      }
+    }
+
+  val relinkVideoLauncher =
+    rememberLauncherForActivityResult(contract = persistableOpenSingleContract) { uri ->
+      val targetId = pendingRelinkJobId
+      pendingRelinkJobId = null
+      if (targetId != null && uri != null) {
+        viewModel.relinkJob(targetId, uri)
       }
     }
 
@@ -143,6 +191,44 @@ fun CompressXApp(
       com.example.engine.CompressionLogger.e("CompressXUI", "Failed launching SAF video picker", t)
       viewModel.reportMessage("No video file picker available on this device.")
     }
+  }
+
+  val launchRelinkPicker: (String) -> Unit = { jobId ->
+    pendingRelinkJobId = jobId
+    try {
+      relinkVideoLauncher.launch(arrayOf("video/*"))
+    } catch (t: Throwable) {
+      pendingRelinkJobId = null
+      com.example.engine.CompressionLogger.e("CompressXUI", "Failed launching relink video picker", t)
+      viewModel.reportMessage("No file picker available to relink this video.")
+    }
+  }
+
+  val isBatteryUnrestricted =
+    remember(uiState.guardrails.batteryPercent) {
+      runCatching {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+      }.getOrDefault(false)
+    }
+
+  // Google-Play-compliant shortcut to system Battery Optimization settings (no prohibited permission)
+  val openBatterySettings: () -> Unit = {
+    try {
+      val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+      context.startActivity(intent)
+    } catch (_: Throwable) {
+      runCatching {
+        val fallback =
+          Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", context.packageName, null)
+          }
+        context.startActivity(fallback)
+      }.onFailure {
+        viewModel.reportMessage("Open Android Settings → Apps → CompressX Studio → Battery → Unrestricted.")
+      }
+    }
+    Unit
   }
 
   val launchPhotoPicker = {
@@ -402,9 +488,10 @@ fun CompressXApp(
               onAddSafVideos = launchSafPicker,
               onStartOrResume = startBatchWithNotificationCheck,
               onPause = { viewModel.pauseBatch() },
-              onMoveJob = { from, to, visible -> viewModel.moveJob(from, to, visible) },
+              onMoveJobById = { jobId, dir, visibleIds -> viewModel.moveJobById(jobId, dir, visibleIds) },
               onCancelJob = { viewModel.cancelJob(it) },
               onRetryJob = { viewModel.retryJob(it) },
+              onRelinkJob = launchRelinkPicker,
               onRetryAllFailed = { viewModel.retryAllFailed() },
               onDeleteJob = { viewModel.deleteJob(it) },
               onClearCompleted = { viewModel.clearCompleted() },
@@ -445,6 +532,8 @@ fun CompressXApp(
               onToggleThermalProtection = { viewModel.setThermalProtection(it) },
               onTogglePauseLowBattery = { viewModel.setPauseOnLowBattery(it) },
               onToggleAutoResume = { viewModel.setAutoResumeAfterRestart(it) },
+              isBatteryUnrestricted = isBatteryUnrestricted,
+              onOpenBatterySettings = openBatterySettings,
             )
           }
         }
